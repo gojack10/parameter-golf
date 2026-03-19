@@ -263,6 +263,24 @@ class RunMonitor:
             "early_stop_reason": self.stop_reason,
             "model_params": model_params,
         })
+        self._auto_ingest()
+
+    # ------------------------------------------------------------------
+    # Auto-ingest into SQLite  (called at end of emit_final)
+    # ------------------------------------------------------------------
+
+    def _auto_ingest(self) -> None:
+        """Ingest this run's JSONL into runs.db. Best-effort — never fails the run."""
+        try:
+            from ingest_runs import ensure_schema, ingest_jsonl
+            import sqlite3
+            conn = sqlite3.connect("runs.db")
+            ensure_schema(conn)
+            ingest_jsonl(conn, self.jsonl_path)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass  # DB ingest is nice-to-have, never worth crashing a run
 
     # ------------------------------------------------------------------
     # Status line for human-readable log

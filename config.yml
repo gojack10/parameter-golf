@@ -1,0 +1,62 @@
+# Parameter Golf — Current Best Configuration
+# Source of truth for env vars passed to train_gpt.py / train_gpt_mlx.py
+# Updated after each winning probe. Git-tracked.
+#
+# Usage: the probe-optimize skill reads this, constructs env var prefix.
+# Baseline: OpenAI NaiveBaseline (2026-03-17)
+
+# --- Performance ---
+best_bpb: 1.2244          # post-quant, 8xH100
+best_bpb_prequant: 1.2172
+artifact_bytes: 15863489   # code + compressed model
+artifact_limit: 16000000
+
+# --- Model ---
+VOCAB_SIZE: 1024
+NUM_LAYERS: 9
+MODEL_DIM: 512
+NUM_HEADS: 8
+NUM_KV_HEADS: 4
+MLP_MULT: 2
+TIE_EMBEDDINGS: 1
+TIED_EMBED_INIT_STD: 0.005
+LOGIT_SOFTCAP: 30.0
+ROPE_BASE: 10000.0
+QK_GAIN_INIT: 1.5
+
+# --- Training ---
+TRAIN_BATCH_TOKENS: 524288
+TRAIN_SEQ_LEN: 1024
+ITERATIONS: 20000
+WARMUP_STEPS: 20
+WARMDOWN_ITERS: 1200
+MAX_WALLCLOCK_SECONDS: 600
+SEED: 1337
+
+# --- Optimizer ---
+TIED_EMBED_LR: 0.05
+EMBED_LR: 0.6
+HEAD_LR: 0.008
+MATRIX_LR: 0.04
+SCALAR_LR: 0.04
+MUON_MOMENTUM: 0.95
+MUON_BACKEND_STEPS: 5
+MUON_MOMENTUM_WARMUP_START: 0.85
+MUON_MOMENTUM_WARMUP_STEPS: 500
+BETA1: 0.9
+BETA2: 0.95
+ADAM_EPS: 1.0e-8
+GRAD_CLIP_NORM: 0.0
+
+# --- Validation ---
+VAL_BATCH_SIZE: 524288
+VAL_LOSS_EVERY: 1000
+TRAIN_LOG_EVERY: 200
+
+# --- Data ---
+DATA_PATH: ./data/datasets/fineweb10B_sp1024
+TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
+
+# --- Improvement Log ---
+# Each entry: commit, bpb, description
+improvements: []

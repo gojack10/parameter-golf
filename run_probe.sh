@@ -144,6 +144,12 @@ if [[ ${#OVERRIDES[@]} -gt 0 ]]; then
 fi
 echo "Command:  $TRAIN_CMD ${EXTRA_ARGS[*]:-}"
 echo ""
+if [[ -n "${PROBE_HYPOTHESIS:-}" ]]; then
+    echo "Hypothesis: $PROBE_HYPOTHESIS"
+fi
+if [[ -n "${PROBE_NOTES:-}" ]]; then
+    echo "Notes: $PROBE_NOTES"
+fi
 echo "Key env vars:"
 echo "  MATRIX_LR=$MATRIX_LR  SCALAR_LR=$SCALAR_LR  EMBED_LR=$EMBED_LR"
 echo "  MUON_MOMENTUM=$MUON_MOMENTUM  EVAL_STRIDE=$EVAL_STRIDE"

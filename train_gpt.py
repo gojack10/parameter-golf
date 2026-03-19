@@ -1171,7 +1171,9 @@ def main() -> None:
                 group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), float('inf'))
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1199,7 +1201,7 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
             if monitor:
-                monitor.log_train(step, train_loss.item(), approx_training_time_ms, lr_scale=scale)
+                monitor.log_train(step, train_loss.item(), approx_training_time_ms, lr_scale=scale, grad_norm=grad_norm.item())
                 if do_profile:
                     sections = profiler.collect()
                     if sections:
@@ -1305,10 +1307,15 @@ def main() -> None:
         )
         log0(f"sliding_window_eval_exact val_loss:{sq_val_loss:.8f} val_bpb:{sq_val_bpb:.8f}")
 
+    # Sliding window results (None if eval_stride disabled or not master)
+    sw_loss = sq_val_loss if (master_process and args.eval_stride > 0) else None
+    sw_bpb = sq_val_bpb if (master_process and args.eval_stride > 0) else None
+
     if monitor:
         monitor.emit_final(
             step=step, wall_ms=training_time_ms, val_loss=val_loss, val_bpb=val_bpb,
             q_val_loss=q_val_loss, q_val_bpb=q_val_bpb,
+            sw_val_loss=sw_loss, sw_val_bpb=sw_bpb,
             bytes_total=quant_file_bytes + code_bytes, bytes_model=quant_file_bytes,
             bytes_code=code_bytes, model_params=n_params,
         )

@@ -60,22 +60,24 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
                 """INSERT OR REPLACE INTO runs
                    (run_id, git_hash, steps, wall_ms,
                     vl_prequant, vb_prequant, vl_postquant, vb_postquant,
+                    vl_sw_postquant, vb_sw_postquant,
                     bytes_total, bytes_model, bytes_code, model_params,
                     early_stopped, early_stop_reason,
                     num_layers, model_dim, num_heads, num_kv_heads,
                     mlp_mult, vocab_size, train_seq_len, iterations,
                     matrix_lr, scalar_lr, embed_lr, muon_momentum,
                     logit_softcap, seed,
-                    config_json)
+                    config_json, hypothesis, notes)
                    VALUES (?, ?, ?, ?,
                            ?, ?, ?, ?,
+                           ?, ?,
                            ?, ?, ?, ?,
                            ?, ?,
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
                            ?, ?, ?, ?,
                            ?, ?,
-                           ?)""",
+                           ?, ?, ?)""",
                 (
                     run_id,
                     ev.get("git"),
@@ -85,6 +87,8 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
                     ev.get("vb_prequant"),
                     ev.get("vl_postquant"),
                     ev.get("vb_postquant"),
+                    ev.get("vl_sw_postquant"),
+                    ev.get("vb_sw_postquant"),
                     ev.get("bytes_total"),
                     ev.get("bytes_model"),
                     ev.get("bytes_code"),
@@ -107,6 +111,8 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
                     config_data.get("logit_softcap"),
                     config_data.get("seed"),
                     json.dumps(config_data) if config_data else None,
+                    config_data.get("hypothesis"),
+                    config_data.get("notes"),
                 ),
             )
             counts["final"] += 1
@@ -137,6 +143,22 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
                 ),
             )
             counts["val"] += 1
+
+        elif t == "train":
+            conn.execute(
+                """INSERT OR REPLACE INTO train_checkpoints
+                   (run_id, step, train_loss, lr, grad_norm, elapsed_ms)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    ev.get("s"),
+                    ev.get("tl"),
+                    ev.get("lr"),
+                    ev.get("gn"),
+                    ev.get("ms"),
+                ),
+            )
+            counts["train"] += 1
 
         elif t == "profile":
             step = ev.get("s")

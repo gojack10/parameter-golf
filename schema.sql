@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS runs (
     vb_prequant     REAL,       -- val BPB before quantization
     vl_postquant    REAL,       -- val loss after quantization
     vb_postquant    REAL,       -- val BPB after quantization (THE competition metric)
+    vl_sw_postquant REAL,       -- sliding window val loss (post-quant, stride=EVAL_STRIDE)
+    vb_sw_postquant REAL,       -- sliding window val BPB (post-quant) — best eval metric
 
     -- artifact size
     bytes_total     INTEGER,    -- code + compressed model
@@ -62,8 +64,9 @@ CREATE TABLE IF NOT EXISTS runs (
     -- full config snapshot (all hyperparameters as JSON)
     config_json     TEXT,
 
-    -- free-text notes (agent or human can annotate)
-    notes           TEXT
+    -- probe metadata
+    hypothesis      TEXT,       -- what this run is testing (from PROBE_HYPOTHESIS env var)
+    notes           TEXT        -- free-text notes (agent or human can annotate)
 );
 
 -- ============================================================
@@ -79,6 +82,22 @@ CREATE TABLE IF NOT EXISTS val_checkpoints (
     val_bpb     REAL,
     ref_bpb     REAL,           -- reference curve value at this step (NULL if no ref)
     status      TEXT,           -- ON_TRACK, BEATING, BEHIND, KILL_*
+    elapsed_ms  REAL,
+    PRIMARY KEY (run_id, step)
+);
+
+-- ============================================================
+-- TRAIN_CHECKPOINTS — training loss at logged steps
+-- Source: "train" events in JSONL (emitted at TRAIN_LOG_EVERY cadence)
+-- Enables: training loss curves, LR schedule visualization, grad norm monitoring
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS train_checkpoints (
+    run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    step        INTEGER NOT NULL,
+    train_loss  REAL,
+    lr          REAL,           -- learning rate scale at this step
+    grad_norm   REAL,           -- total gradient norm (NULL until grad norm logging enabled)
     elapsed_ms  REAL,
     PRIMARY KEY (run_id, step)
 );
@@ -153,6 +172,7 @@ SELECT
     run_id,
     git_hash,
     vb_postquant,
+    vb_sw_postquant,
     vb_prequant,
     step_avg_ms,
     steps,
@@ -161,6 +181,7 @@ SELECT
     num_heads,
     bytes_total,
     early_stopped,
+    hypothesis,
     notes,
     created_at
 FROM runs
@@ -208,6 +229,7 @@ SELECT
     matrix_lr,
     scalar_lr,
     bytes_total,
+    hypothesis,
     notes
 FROM runs;
 

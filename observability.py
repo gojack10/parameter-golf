@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 from pathlib import Path
 
@@ -106,6 +107,10 @@ class RunMonitor:
         self._prev_bpb = float("inf")
         self.stop_reason: str | None = None
 
+        # Probe metadata (from env vars, set via run_probe.sh KEY=VALUE)
+        self.hypothesis = os.environ.get("PROBE_HYPOTHESIS", "")
+        self.probe_notes = os.environ.get("PROBE_NOTES", "")
+
         # Git hash (best effort)
         self.git_hash = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -129,7 +134,10 @@ class RunMonitor:
         self._write({
             "t": "config", "run_id": self.run_id, "git": self.git_hash,
             "early_stop": self.early_stop, "ref_file": self.ref_file,
-            "tolerance": self.tolerance, "model_params": model_params, **kwargs,
+            "tolerance": self.tolerance, "model_params": model_params,
+            "hypothesis": self.hypothesis or None,
+            "notes": self.probe_notes or None,
+            **kwargs,
         })
 
     # ------------------------------------------------------------------
@@ -213,15 +221,21 @@ class RunMonitor:
     # Train step logging  (call at each logged train step)
     # ------------------------------------------------------------------
 
-    def log_train(self, step: int, train_loss: float, elapsed_ms: float, lr_scale: float = 1.0) -> None:
+    def log_train(
+        self, step: int, train_loss: float, elapsed_ms: float,
+        lr_scale: float = 1.0, grad_norm: float | None = None,
+    ) -> None:
         tl = train_loss if math.isfinite(train_loss) else None
-        self._write({
+        ev: dict = {
             "t": "train", "s": step,
             "tl": round(tl, 6) if tl is not None else None,
             "lr": round(lr_scale, 6),
             "ms": round(elapsed_ms),
             "avg": round(elapsed_ms / max(step, 1), 2),
-        })
+        }
+        if grad_norm is not None:
+            ev["gn"] = round(grad_norm, 6)
+        self._write(ev)
 
     # ------------------------------------------------------------------
     # Step profile logging  (call on logged steps when profiling enabled)
@@ -248,12 +262,14 @@ class RunMonitor:
         val_bpb: float,
         q_val_loss: float,
         q_val_bpb: float,
+        sw_val_loss: float | None = None,
+        sw_val_bpb: float | None = None,
         bytes_total: int,
         bytes_model: int,
         bytes_code: int,
         model_params: int,
     ) -> None:
-        self._write({
+        ev: dict = {
             "t": "final", "run_id": self.run_id, "git": self.git_hash,
             "steps": step, "wall_ms": round(wall_ms),
             "vl_prequant": round(val_loss, 8), "vb_prequant": round(val_bpb, 8),
@@ -262,7 +278,12 @@ class RunMonitor:
             "early_stopped": self.stop_reason is not None,
             "early_stop_reason": self.stop_reason,
             "model_params": model_params,
-        })
+        }
+        if sw_val_loss is not None:
+            ev["vl_sw_postquant"] = round(sw_val_loss, 8)
+        if sw_val_bpb is not None:
+            ev["vb_sw_postquant"] = round(sw_val_bpb, 8)
+        self._write(ev)
         self._auto_ingest()
 
     # ------------------------------------------------------------------

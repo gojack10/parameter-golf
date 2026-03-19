@@ -57,6 +57,15 @@ TRAIN_LOG_EVERY: 200
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
 TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
 
+# --- Early Stopping ---
+# Reference curve is hardware-specific. Set EARLY_STOP_REF per tier.
+# EARLY_STOP=0 to "let it ride" (disables auto-kill, JSONL still emitted)
+EARLY_STOP: 1
+EARLY_STOP_REF: ""                    # e.g. reference_bpb_8xh100.json
+EARLY_STOP_TOLERANCE: 0.05           # kill if >5% behind reference
+EARLY_STOP_MIN_STEP: 500             # don't judge before step 500
+EARLY_STOP_PATIENCE: 3               # consecutive bad val checks before kill
+
 # --- Improvement Log ---
 # Each entry: commit, bpb, description
 improvements: []

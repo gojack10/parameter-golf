@@ -15,6 +15,7 @@ import random
 import subprocess
 import sys
 import time
+import json
 import uuid
 import zlib
 from pathlib import Path
@@ -85,6 +86,13 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Early stopping against a reference BPB curve.
+    early_stop = bool(int(os.environ.get("EARLY_STOP", "1")))
+    early_stop_ref = os.environ.get("EARLY_STOP_REF", "")
+    early_stop_tolerance = float(os.environ.get("EARLY_STOP_TOLERANCE", "0.05"))
+    early_stop_min_step = int(os.environ.get("EARLY_STOP_MIN_STEP", "500"))
+    early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", "3"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -909,6 +917,22 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
+    # Observability: structured JSONL logging + early-stop
+    from observability import RunMonitor
+    monitor = RunMonitor(
+        run_id=args.run_id, early_stop=args.early_stop, ref_file=args.early_stop_ref,
+        tolerance=args.early_stop_tolerance, min_step=args.early_stop_min_step,
+        patience=args.early_stop_patience,
+    ) if master_process else None
+    if monitor:
+        log0(f"early_stop:{args.early_stop} ref={args.early_stop_ref} tolerance={args.early_stop_tolerance}")
+        monitor.emit_config(
+            model_params=n_params, vocab_size=args.vocab_size, num_layers=args.num_layers,
+            model_dim=args.model_dim, num_heads=args.num_heads, num_kv_heads=args.num_kv_heads,
+            iterations=args.iterations, max_wallclock_seconds=args.max_wallclock_seconds,
+            matrix_lr=args.matrix_lr, scalar_lr=args.scalar_lr, seed=args.seed,
+        )
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -993,6 +1017,11 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if monitor:
+                status = monitor.check_val(step, val_loss, val_bpb, training_time_ms, is_last_step=last_step)
+                if monitor.stop_reason and stop_after_step is None:
+                    stop_after_step = step
+                    log0(monitor.status_line(step, val_bpb))
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1044,6 +1073,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if monitor:
+                monitor.log_train(step, train_loss.item(), approx_training_time_ms, lr_scale=scale)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1117,6 +1148,14 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if monitor:
+        monitor.emit_final(
+            step=step, wall_ms=training_time_ms, val_loss=val_loss, val_bpb=val_bpb,
+            q_val_loss=q_val_loss, q_val_bpb=q_val_bpb,
+            bytes_total=quant_file_bytes + code_bytes, bytes_model=quant_file_bytes,
+            bytes_code=code_bytes, model_params=n_params,
+        )
 
     if distributed:
         dist.destroy_process_group()

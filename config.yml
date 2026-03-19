@@ -2,7 +2,8 @@
 # Source of truth for env vars passed to train_gpt.py / train_gpt_mlx.py
 # Updated after each winning probe. Git-tracked.
 #
-# Usage: the probe-optimize skill reads this, constructs env var prefix.
+# Usage: run_probe.sh reads this and exports all UPPER_CASE keys as env vars.
+# NEVER run bare `uv run python train_gpt.py` — always use ./run_probe.sh.
 # Baseline: OpenAI NaiveBaseline (2026-03-17)
 
 # --- Performance ---

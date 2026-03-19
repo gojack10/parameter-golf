@@ -85,6 +85,13 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
 
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    normuon_beta2 = float(os.environ.get("NORMUON_BETA2", "0.0"))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.5"))
+    swa_every = int(os.environ.get("SWA_EVERY", "200"))
+    smeargate_enabled = bool(int(os.environ.get("SMEARGATE_ENABLED", "0")))
+
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -101,10 +108,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, beta2: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, beta2=beta2),
         )
 
     @torch.no_grad()
@@ -126,6 +133,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            beta2 = group["beta2"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -143,6 +151,15 @@ class Muon(torch.optim.Optimizer):
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    if beta2 > 0 and g.ndim == 2:
+                        if "nu" not in state:
+                            state["nu"] = torch.zeros(g.size(0), device=g.device, dtype=torch.float32)
+                        nu = state["nu"]
+                        row_var = (g.float() ** 2).mean(dim=1)
+                        nu.mul_(beta2).add_(row_var, alpha=1 - beta2)
+                        g_norm = g.float().norm()
+                        g_normed = g.float() / (nu.sqrt().unsqueeze(1) + 1e-8)
+                        g = (g_normed * (g_norm / (g_normed.norm() + 1e-8))).to(torch.bfloat16)
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -257,6 +274,8 @@ def eval_val(
 def get_logits(base_model: nn.Module, input_ids: Tensor) -> Tensor:
     x = base_model.tok_emb(input_ids)
     x = F.rms_norm(x, (x.size(-1),))
+    if base_model.smear is not None:
+        x = base_model.smear(x)
     x0 = x
     skips: list[Tensor] = []
     for i in range(base_model.num_encoder_layers):
@@ -327,7 +346,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear",
     ).split(",")
     if pattern
 )
@@ -547,10 +566,20 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+_QAT_ENABLED = bool(int(os.environ.get("QAT_ENABLED", "0")))
+
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if _QAT_ENABLED and self.training and self.weight.ndim == 2:
+            w32 = self.weight.float()
+            qmax = float(QUANT_MAX)
+            clip_abs = torch.quantile(w32.abs(), INT8_CLIP_Q, dim=1)
+            scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+            w_q = torch.clamp(torch.round(w32 / scale[:, None]), -QUANT_MAX, QUANT_MAX) * scale[:, None]
+            w = w + (w_q.to(x.dtype) - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -641,6 +670,17 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))
+        x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
+        return (1 - g) * x + g * x_prev
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -696,6 +736,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        smeargate_enabled: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -704,6 +745,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.smear = SmearGate(model_dim) if smeargate_enabled else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -737,6 +779,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -854,6 +898,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        smeargate_enabled=args.smeargate_enabled,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -875,6 +920,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.smear is not None:
+        scalar_params.append(base_model.smear.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -887,6 +934,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        beta2=args.normuon_beta2,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -986,6 +1034,9 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    swa_checkpoints: list[dict[str, Tensor]] = []
+    swa_collecting = False
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1079,6 +1130,14 @@ def main() -> None:
             profiler.mark("end")
 
         step += 1
+
+        if args.swa_enabled and not swa_collecting and scale < args.swa_start_frac:
+            swa_collecting = True
+            log0(f"swa:start step:{step} lr_scale:{scale:.4f}")
+        if swa_collecting and step % args.swa_every == 0:
+            swa_checkpoints.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
+            log0(f"swa:checkpoint step:{step} count:{len(swa_checkpoints)}")
+
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1108,6 +1167,16 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if swa_checkpoints:
+        log0(f"swa:averaging {len(swa_checkpoints)} checkpoints")
+        avg_state = {}
+        for key in swa_checkpoints[0]:
+            avg_state[key] = torch.stack([ckpt[key].float() for ckpt in swa_checkpoints]).mean(dim=0)
+        for key in avg_state:
+            avg_state[key] = avg_state[key].to(dtype=base_model.state_dict()[key].dtype)
+        base_model.load_state_dict(avg_state, strict=True)
+        del swa_checkpoints, avg_state
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")

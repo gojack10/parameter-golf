@@ -57,6 +57,11 @@ TRAIN_LOG_EVERY: 200
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
 TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
 
+# --- Profiling ---
+# Per-section CUDA event timing. Emits "profile" JSONL events on TRAIN_LOG_EVERY cadence.
+# Sections: data, fwd_bwd, optimizer. Near-zero overhead (only instruments logged steps).
+PROFILE_SECTIONS: 0
+
 # --- Early Stopping ---
 # Reference curve is hardware-specific. Set EARLY_STOP_REF per tier.
 # EARLY_STOP=0 to "let it ride" (disables auto-kill, JSONL still emitted)

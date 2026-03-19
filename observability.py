@@ -3,6 +3,8 @@ Training run observability: structured JSONL logging + early-stop state machine.
 
 Keeps train_gpt.py clean — all monitoring logic lives here.
 train_gpt.py calls ~5 methods; this module handles the rest.
+
+StepProfiler: optional per-section CUDA event timing (PROFILE_SECTIONS=1).
 """
 
 from __future__ import annotations
@@ -11,6 +13,57 @@ import json
 import math
 import subprocess
 from pathlib import Path
+
+import torch
+
+
+class StepProfiler:
+    """CUDA event-based section timer. Near-zero overhead when disabled.
+
+    Usage in training loop:
+        profiler = StepProfiler(enabled=True)
+
+        # each step:
+        profiler.mark("data")           # start timing 'data' section
+        x, y = loader.next_batch(...)
+        profiler.mark("fwd_bwd")        # end 'data', start 'fwd_bwd'
+        loss = model(x, y); loss.backward()
+        profiler.mark("optimizer")
+        for opt in optimizers: opt.step()
+        profiler.mark("end")            # end last section
+
+        # on log steps, harvest the timings:
+        sections = profiler.collect()    # {"data": 1.2, "fwd_bwd": 15.3, ...}
+    """
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._marks: list[tuple[str, torch.cuda.Event]] = []
+
+    def mark(self, name: str) -> None:
+        if not self.enabled:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._marks.append((name, ev))
+
+    def collect(self) -> dict[str, float] | None:
+        """Sync and return section timings in ms. Returns None if disabled or <2 marks."""
+        if not self.enabled or len(self._marks) < 2:
+            self._marks.clear()
+            return None
+        torch.cuda.synchronize()
+        sections: dict[str, float] = {}
+        for i in range(len(self._marks) - 1):
+            name = self._marks[i][0]
+            start_ev = self._marks[i][1]
+            end_ev = self._marks[i + 1][1]
+            sections[name] = start_ev.elapsed_time(end_ev)
+        self._marks.clear()
+        return sections
+
+    def reset(self) -> None:
+        self._marks.clear()
 
 
 class RunMonitor:
@@ -168,6 +221,18 @@ class RunMonitor:
             "lr": round(lr_scale, 6),
             "ms": round(elapsed_ms),
             "avg": round(elapsed_ms / max(step, 1), 2),
+        })
+
+    # ------------------------------------------------------------------
+    # Step profile logging  (call on logged steps when profiling enabled)
+    # ------------------------------------------------------------------
+
+    def log_profile(self, step: int, sections: dict[str, float]) -> None:
+        """Emit a profile event with per-section timing in ms."""
+        self._write({
+            "t": "profile", "s": step,
+            **{k: round(v, 3) for k, v in sections.items()},
+            "total": round(sum(sections.values()), 3),
         })
 
     # ------------------------------------------------------------------

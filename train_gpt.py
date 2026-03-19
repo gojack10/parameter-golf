@@ -94,6 +94,9 @@ class Hyperparameters:
     early_stop_min_step = int(os.environ.get("EARLY_STOP_MIN_STEP", "500"))
     early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", "3"))
 
+    # Per-section step profiling (CUDA events). Piggybacks on TRAIN_LOG_EVERY cadence.
+    profile_sections = bool(int(os.environ.get("PROFILE_SECTIONS", "0")))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -917,8 +920,11 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    # Observability: structured JSONL logging + early-stop
-    from observability import RunMonitor
+    # Observability: structured JSONL logging + early-stop + section profiling
+    from observability import RunMonitor, StepProfiler
+    profiler = StepProfiler(enabled=args.profile_sections) if master_process else None
+    if master_process and args.profile_sections:
+        log0("profile_sections:enabled (CUDA event timing on logged steps)")
     monitor = RunMonitor(
         run_id=args.run_id, early_stop=args.early_stop, ref_file=args.early_stop_ref,
         tolerance=args.early_stop_tolerance, min_step=args.early_stop_min_step,
@@ -1036,16 +1042,32 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+
+        # Profile: only instrument on log steps to avoid any overhead on hot path
+        next_step = step + 1
+        will_log = (
+            args.train_log_every > 0
+            and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
+        do_profile = profiler is not None and will_log
+        if do_profile:
+            profiler.mark("data")
+
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            if do_profile and micro_step == 0:
+                profiler.mark("fwd_bwd")
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+
+        if do_profile:
+            profiler.mark("optimizer")
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1062,6 +1084,9 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        if do_profile:
+            profiler.mark("end")
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1075,6 +1100,10 @@ def main() -> None:
             )
             if monitor:
                 monitor.log_train(step, train_loss.item(), approx_training_time_ms, lr_scale=scale)
+                if do_profile:
+                    sections = profiler.collect()
+                    if sections:
+                        monitor.log_profile(step, sections)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

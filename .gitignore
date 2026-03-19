@@ -14,3 +14,4 @@ logs/
 final_model.pt
 final_model.int8.ptz
 runs.db
+probe_*.log

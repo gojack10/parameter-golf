@@ -44,42 +44,15 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
             continue
         events.append(json.loads(line))
 
+    # --- Pass 1: collect config and insert the runs row (from "final" event) ---
+    # The runs row must exist before val_checkpoints / step_profiles inserts
+    # because those tables have FK constraints referencing runs(run_id).
     for ev in events:
         t = ev.get("t")
 
         if t == "config":
             config_data = ev
             counts["config"] += 1
-
-        elif t == "val":
-            conn.execute(
-                """INSERT OR REPLACE INTO val_checkpoints
-                   (run_id, step, val_loss, val_bpb, ref_bpb, status, elapsed_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    config_data.get("run_id", jsonl_path.stem),
-                    ev.get("s"),
-                    ev.get("vl"),
-                    ev.get("vb"),
-                    ev.get("ref"),
-                    ev.get("status"),
-                    ev.get("ms"),
-                ),
-            )
-            counts["val"] += 1
-
-        elif t == "profile":
-            run_id = config_data.get("run_id", jsonl_path.stem)
-            step = ev.get("s")
-            for section in ("data", "fwd_bwd", "optimizer", "misc"):
-                if section in ev:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO step_profiles
-                           (run_id, step, section, ms)
-                           VALUES (?, ?, ?, ?)""",
-                        (run_id, step, section, ev[section]),
-                    )
-            counts["profile"] += 1
 
         elif t == "final":
             run_id = ev.get("run_id", jsonl_path.stem)
@@ -137,6 +110,45 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
                 ),
             )
             counts["final"] += 1
+
+    # If no "final" event was found, the runs row doesn't exist — skip child inserts
+    if counts["final"] == 0:
+        return counts
+
+    # --- Pass 2: insert val checkpoints and step profiles (FK parent now exists) ---
+    run_id = config_data.get("run_id", jsonl_path.stem)
+
+    for ev in events:
+        t = ev.get("t")
+
+        if t == "val":
+            conn.execute(
+                """INSERT OR REPLACE INTO val_checkpoints
+                   (run_id, step, val_loss, val_bpb, ref_bpb, status, elapsed_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    ev.get("s"),
+                    ev.get("vl"),
+                    ev.get("vb"),
+                    ev.get("ref"),
+                    ev.get("status"),
+                    ev.get("ms"),
+                ),
+            )
+            counts["val"] += 1
+
+        elif t == "profile":
+            step = ev.get("s")
+            for section in ("data", "fwd_bwd", "optimizer", "misc"):
+                if section in ev:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO step_profiles
+                           (run_id, step, section, ms)
+                           VALUES (?, ?, ?, ?)""",
+                        (run_id, step, section, ev[section]),
+                    )
+            counts["profile"] += 1
 
     return counts
 

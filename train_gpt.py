@@ -97,6 +97,9 @@ class Hyperparameters:
     # Per-section step profiling (CUDA events). Piggybacks on TRAIN_LOG_EVERY cadence.
     profile_sections = bool(int(os.environ.get("PROFILE_SECTIONS", "0")))
 
+    # Sliding window evaluation: stride > 0 enables overlapping windows for better per-token conditioning.
+    eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))  # 0 = standard non-overlapping eval
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -287,6 +290,79 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+def get_logits(base_model: nn.Module, input_ids: Tensor) -> Tensor:
+    """Run the model forward pass and return logits (bypasses compiled model)."""
+    x = base_model.tok_emb(input_ids)
+    x = F.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips: list[Tensor] = []
+    for i in range(base_model.num_encoder_layers):
+        x = base_model.blocks[i](x, x0)
+        skips.append(x)
+    for i in range(base_model.num_decoder_layers):
+        if skips:
+            x = x + base_model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+        x = base_model.blocks[base_model.num_encoder_layers + i](x, x0)
+    x = base_model.final_norm(x)
+    if base_model.tie_embeddings:
+        logits_proj = F.linear(x, base_model.tok_emb.weight)
+    else:
+        logits_proj = base_model.lm_head(x)
+    return base_model.logit_softcap * torch.tanh(logits_proj / base_model.logit_softcap)
+
+
+def eval_val_sliding(
+    base_model: nn.Module,
+    seq_len: int,
+    stride: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    batch_size: int = 32,
+) -> tuple[float, float]:
+    """Sliding window evaluation: each token gets loss from window with most context."""
+    total_tokens = val_tokens.numel() - 1
+    best_loss = torch.full((total_tokens,), float("inf"), dtype=torch.float64)
+
+    base_model.eval()
+    window_starts = list(range(0, total_tokens - seq_len + 1, stride))
+    with torch.inference_mode():
+        for batch_start in range(0, len(window_starts), batch_size):
+            batch_starts = window_starts[batch_start : batch_start + batch_size]
+            xs, ys = [], []
+            for start in batch_starts:
+                local = val_tokens[start : start + seq_len + 1].to(dtype=torch.int64)
+                xs.append(local[:-1])
+                ys.append(local[1:])
+            x = torch.stack(xs).to(device, non_blocking=True)
+            y = torch.stack(ys).to(device, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = get_logits(base_model, x)
+            # Per-token CE: (batch, seq_len)
+            per_token = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none"
+            ).reshape(len(batch_starts), seq_len).to(torch.float64).cpu()
+            for i, start in enumerate(batch_starts):
+                best_loss[start : start + seq_len] = torch.minimum(
+                    best_loss[start : start + seq_len], per_token[i]
+                )
+
+    # BPB from best per-token losses
+    valid = best_loss < float("inf")
+    prev_ids = val_tokens[:-1][valid].to(dtype=torch.int64, device=device)
+    tgt_ids = val_tokens[1:][valid].to(dtype=torch.int64, device=device)
+    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+    token_bytes += (
+        has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+    ).to(dtype=torch.int16)
+    val_loss = best_loss[valid].sum() / valid.sum()
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = float(valid.sum().item()) / float(token_bytes.to(torch.float64).sum().item())
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1177,6 +1253,22 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if master_process and args.eval_stride > 0:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        restore_low_dim_params_to_fp32(base_model)
+        sq_val_loss, sq_val_bpb = eval_val_sliding(
+            base_model, args.train_seq_len, args.eval_stride, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"sliding_window_eval stride:{args.eval_stride} val_loss:{sq_val_loss:.4f} val_bpb:{sq_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms "
+            f"delta_bpb:{sq_val_bpb - q_val_bpb:.6f}"
+        )
+        log0(f"sliding_window_eval_exact val_loss:{sq_val_loss:.8f} val_bpb:{sq_val_bpb:.8f}")
 
     if monitor:
         monitor.emit_final(

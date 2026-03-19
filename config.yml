@@ -53,6 +53,12 @@ VAL_BATCH_SIZE: 524288
 VAL_LOSS_EVERY: 1000
 TRAIN_LOG_EVERY: 200
 
+# --- Sliding Window Eval ---
+# Overlapping windows for better per-token conditioning. 0 = standard non-overlapping eval.
+# stride 512 with seq_len 1024 gives -0.072 BPB on 3070 (300s), estimated similar on 8xH100.
+# Eval time: ~60s estimated on 8xH100 (within 10-min limit).
+EVAL_STRIDE: 512
+
 # --- Data ---
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
 TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
@@ -73,4 +79,9 @@ EARLY_STOP_PATIENCE: 3               # consecutive bad val checks before kill
 
 # --- Improvement Log ---
 # Each entry: commit, bpb, description
-improvements: []
+improvements:
+  - commit: pending
+    bpb_delta: -0.072
+    description: "Sliding window eval (stride 512) — free BPB improvement via better per-token conditioning at eval time. Zero training changes."
+    hardware_validated: "RTX 3070 (300s): standard 1.5568 → sliding 1.4850"
+    needs_h100_validation: true

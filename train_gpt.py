@@ -92,6 +92,9 @@ class Hyperparameters:
     swa_every = int(os.environ.get("SWA_EVERY", "200"))
     smeargate_enabled = bool(int(os.environ.get("SMEARGATE_ENABLED", "0")))
 
+    mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", "1"))
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", "0.1"))
+
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -737,6 +740,8 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         smeargate_enabled: bool = False,
+        mtp_num_heads: int = 0,
+        mtp_loss_weight: float = 0.1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -744,6 +749,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mtp_num_heads = mtp_num_heads
+        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.smear = SmearGate(model_dim) if smeargate_enabled else None
         self.num_encoder_layers = num_layers // 2
@@ -767,6 +774,11 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.mtp_heads = nn.ModuleList(
+            [CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)]
+        )
+        for head in self.mtp_heads:
+            head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -792,16 +804,49 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        _, seqlen, dim = x.shape
+        x_flat = x.reshape(-1, dim)
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x_flat, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
+            mtp_loss_sum = x.new_zeros(())
+            mtp_loss_count = 0
+            for k, mtp_head in enumerate(self.mtp_heads):
+                valid_t = seqlen - (k + 1)
+                if valid_t <= 0:
+                    continue
+                mtp_hidden = x[:, :valid_t, :].reshape(-1, dim)
+                mtp_targets = target_ids[:, k + 1 :].reshape(-1)
+                mtp_logits_proj = mtp_head(mtp_hidden)
+                mtp_logits = self.logit_softcap * torch.tanh(mtp_logits_proj / self.logit_softcap)
+                mtp_loss_sum = mtp_loss_sum + F.cross_entropy(mtp_logits.float(), mtp_targets, reduction="mean")
+                mtp_loss_count += 1
+            if mtp_loss_count > 0:
+                main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+
+        return main_loss
+
+
+def export_state_dict_without_mtp(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {name: tensor for name, tensor in state_dict.items() if "mtp_heads" not in name}
+
+
+def load_export_state_dict_into_model(model: nn.Module, state_dict: dict[str, Tensor]) -> None:
+    incompat = model.load_state_dict(state_dict, strict=False)
+    if incompat.unexpected_keys:
+        raise RuntimeError(f"Unexpected keys: {incompat.unexpected_keys}")
+    non_mtp_missing = [k for k in incompat.missing_keys if "mtp_heads" not in k]
+    if non_mtp_missing:
+        raise RuntimeError(f"Missing non-MTP keys: {non_mtp_missing}")
 
 
 def main() -> None:
@@ -899,6 +944,8 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         smeargate_enabled=args.smeargate_enabled,
+        mtp_num_heads=args.mtp_num_heads,
+        mtp_loss_weight=args.mtp_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -918,6 +965,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.mtp_num_heads > 0:
+        matrix_params.extend([p for p in base_model.mtp_heads.parameters() if p.ndim == 2])
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.smear is not None:
@@ -955,7 +1004,8 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    n_mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
+    log0(f"model_params:{n_params} mtp_params:{n_mtp_params} export_params:{n_params - n_mtp_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1178,15 +1228,16 @@ def main() -> None:
         base_model.load_state_dict(avg_state, strict=True)
         del swa_checkpoints, avg_state
 
+    export_sd = export_state_dict_without_mtp(base_model.state_dict())
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_sd)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1216,7 +1267,7 @@ def main() -> None:
     else:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    load_export_state_dict_into_model(base_model, dequantize_state_dict_int8(quant_state))
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(

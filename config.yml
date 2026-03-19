@@ -80,7 +80,7 @@ EARLY_STOP_PATIENCE: 3               # consecutive bad val checks before kill
 # --- Improvement Log ---
 # Each entry: commit, bpb, description
 improvements:
-  - commit: pending
+  - commit: bdae3d0
     bpb_delta: -0.072
     description: "Sliding window eval (stride 512) — free BPB improvement via better per-token conditioning at eval time. Zero training changes."
     hardware_validated: "RTX 3070 (300s): standard 1.5568 → sliding 1.4850"

@@ -1,15 +1,11 @@
-# Parameter Golf — Current Best Configuration
+# Parameter Golf — Consensus Stack Configuration
 # Source of truth for env vars passed to train_gpt.py / train_gpt_mlx.py
-# Updated after each winning probe. Git-tracked.
-#
+# Updated 2026-03-19: adopted competition-converged settings from 18 PR scrape.
 # Usage: run_probe.sh reads this and exports all UPPER_CASE keys as env vars.
-# NEVER run bare `uv run python train_gpt.py` — always use ./run_probe.sh.
-# Baseline: OpenAI NaiveBaseline (2026-03-17)
 
-# --- Performance ---
-best_bpb: 1.2244          # post-quant, 8xH100
+best_bpb: 1.2244
 best_bpb_prequant: 1.2172
-artifact_bytes: 15863489   # code + compressed model
+artifact_bytes: 15863489
 artifact_limit: 16000000
 
 # --- Model ---
@@ -18,36 +14,36 @@ NUM_LAYERS: 9
 MODEL_DIM: 512
 NUM_HEADS: 8
 NUM_KV_HEADS: 4
-MLP_MULT: 2
+MLP_MULT: 3
 TIE_EMBEDDINGS: 1
 TIED_EMBED_INIT_STD: 0.005
 LOGIT_SOFTCAP: 30.0
 ROPE_BASE: 10000.0
-QK_GAIN_INIT: 1.5
+QK_GAIN_INIT: 1.7
 
 # --- Training ---
-TRAIN_BATCH_TOKENS: 524288
-TRAIN_SEQ_LEN: 1024
+TRAIN_BATCH_TOKENS: 786432
+TRAIN_SEQ_LEN: 2048
 ITERATIONS: 20000
 WARMUP_STEPS: 20
-WARMDOWN_ITERS: 1200
+WARMDOWN_ITERS: 3000
 MAX_WALLCLOCK_SECONDS: 600
 SEED: 1337
 
 # --- Optimizer ---
-TIED_EMBED_LR: 0.05
+TIED_EMBED_LR: 0.03
 EMBED_LR: 0.6
 HEAD_LR: 0.008
-MATRIX_LR: 0.04
-SCALAR_LR: 0.04
-MUON_MOMENTUM: 0.95
+MATRIX_LR: 0.02
+SCALAR_LR: 0.02
+MUON_MOMENTUM: 0.99
 MUON_BACKEND_STEPS: 5
-MUON_MOMENTUM_WARMUP_START: 0.85
-MUON_MOMENTUM_WARMUP_STEPS: 500
+MUON_MOMENTUM_WARMUP_START: 0.92
+MUON_MOMENTUM_WARMUP_STEPS: 1500
 BETA1: 0.9
 BETA2: 0.95
 ADAM_EPS: 1.0e-8
-GRAD_CLIP_NORM: 0.0
+GRAD_CLIP_NORM: 0.3
 
 # --- Validation ---
 VAL_BATCH_SIZE: 524288
@@ -55,34 +51,37 @@ VAL_LOSS_EVERY: 1000
 TRAIN_LOG_EVERY: 200
 
 # --- Sliding Window Eval ---
-# Overlapping windows for better per-token conditioning. 0 = standard non-overlapping eval.
-# stride 512 with seq_len 1024 gives -0.072 BPB on 3070 (300s), estimated similar on 8xH100.
-# Eval time: ~60s estimated on 8xH100 (within 10-min limit).
-EVAL_STRIDE: 512
+EVAL_STRIDE: 256
+
+# --- Quantization / Compression ---
+QUANT_MAX: 31
+COMPRESSOR: zstd
+EMBED_FP16: 1
+LATE_K_FP16: 1
+LATE_K_LAYERS: 2
 
 # --- Data ---
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
 TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
 
 # --- Profiling ---
-# Per-section CUDA event timing. Emits "profile" JSONL events on TRAIN_LOG_EVERY cadence.
-# Sections: data, fwd_bwd, optimizer. Near-zero overhead (only instruments logged steps).
 PROFILE_SECTIONS: 0
 
 # --- Early Stopping ---
-# Reference curve is hardware-specific. Set EARLY_STOP_REF per tier.
-# EARLY_STOP=0 to "let it ride" (disables auto-kill, JSONL still emitted)
 EARLY_STOP: 1
-EARLY_STOP_REF: ""                    # e.g. reference_bpb_8xh100.json
-EARLY_STOP_TOLERANCE: 0.05           # kill if >5% behind reference
-EARLY_STOP_MIN_STEP: 500             # don't judge before step 500
-EARLY_STOP_PATIENCE: 3               # consecutive bad val checks before kill
+EARLY_STOP_REF: ""
+EARLY_STOP_TOLERANCE: 0.05
+EARLY_STOP_MIN_STEP: 500
+EARLY_STOP_PATIENCE: 3
 
-# --- Improvement Log ---
-# Each entry: commit, bpb, description
 improvements:
   - commit: bdae3d0
     bpb_delta: -0.072
-    description: "Sliding window eval (stride 512) — free BPB improvement via better per-token conditioning at eval time. Zero training changes."
+    description: "Sliding window eval (stride 512)"
     hardware_validated: "RTX 3070 (300s): standard 1.5568 → sliding 1.4850"
+    needs_h100_validation: true
+  - commit: pending
+    bpb_delta: TBD
+    description: "Consensus stack: int6+zstd+MLP3x+fp16embed+train@2048+tuned hparams"
+    hardware_validated: ""
     needs_h100_validation: true

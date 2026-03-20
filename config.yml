@@ -51,7 +51,7 @@ VAL_LOSS_EVERY: 1000
 TRAIN_LOG_EVERY: 200
 
 # --- Sliding Window Eval ---
-EVAL_STRIDE: 256
+EVAL_STRIDE: 0
 
 # --- Quantization / Compression ---
 QUANT_MAX: 31
@@ -79,7 +79,7 @@ MTP_NUM_HEADS: 1
 MTP_LOSS_WEIGHT: 0.1
 
 # --- Test-Time Training (eval-time per-document adaptation) ---
-TTT_ENABLED: 1
+TTT_ENABLED: 0
 TTT_LR: 0.5
 TTT_MIN_DOC_LEN: 2048
 TTT_SPLIT_FRAC: 0.5
@@ -87,6 +87,9 @@ TTT_SPLIT_FRAC: 0.5
 # --- Data ---
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
 TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
+
+# --- Speed Probes ---
+SKIP_ROUNDTRIP: 1
 
 # --- Profiling ---
 PROFILE_SECTIONS: 0

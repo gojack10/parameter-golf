@@ -54,6 +54,7 @@ class Hyperparameters:
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", "0"))  # 0 = disabled
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -290,12 +291,12 @@ def get_logits(base_model: nn.Module, input_ids: Tensor) -> Tensor:
     x0 = x
     skips: list[Tensor] = []
     for i in range(base_model.num_encoder_layers):
-        x = base_model.blocks[i](x, x0)
+        x = base_model.blocks[i % base_model.num_physical_blocks](x, x0)
         skips.append(x)
     for i in range(base_model.num_decoder_layers):
         if skips:
             x = x + base_model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-        x = base_model.blocks[base_model.num_encoder_layers + i](x, x0)
+        x = base_model.blocks[(base_model.num_encoder_layers + i) % base_model.num_physical_blocks](x, x0)
     x = base_model.final_norm(x)
     if base_model.tie_embeddings:
         logits_proj = F.linear(x, base_model.tok_emb.weight)
@@ -578,11 +579,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         if LATE_K_FP16 and LATE_K_LAYERS > 0 and name.endswith("c_k.weight"):
-            num_layers_total = (
+            num_physical = (
                 max((int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")), default=-1) + 1
             )
-            if num_layers_total > 0 and any(
-                f"blocks.{i}." in name for i in range(num_layers_total - LATE_K_LAYERS, num_layers_total)
+            num_virtual = int(os.environ.get("NUM_LAYERS", num_physical))
+            late_physical = {i % num_physical for i in range(num_virtual - LATE_K_LAYERS, num_virtual)}
+            if num_physical > 0 and any(
+                f"blocks.{i}." in name for i in late_physical
             ):
                 passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
                 kept = t.to(dtype=torch.float16).contiguous()
@@ -885,6 +888,7 @@ class GPT(nn.Module):
         smeargate_enabled: bool = False,
         mtp_num_heads: int = 0,
         mtp_loss_weight: float = 0.1,
+        num_unique_layers: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -900,6 +904,8 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        num_physical = num_unique_layers if num_unique_layers > 0 else num_layers
+        self.num_physical_blocks = num_physical
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -910,7 +916,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_physical)
             ]
         )
         self.final_norm = RMSNorm()
@@ -940,12 +946,12 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_physical_blocks](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[(self.num_encoder_layers + i) % self.num_physical_blocks](x, x0)
 
         x = self.final_norm(x)
         _, seqlen, dim = x.shape
@@ -1089,6 +1095,7 @@ def main() -> None:
         smeargate_enabled=args.smeargate_enabled,
         mtp_num_heads=args.mtp_num_heads,
         mtp_loss_weight=args.mtp_loss_weight,
+        num_unique_layers=args.num_unique_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1416,36 +1423,41 @@ def main() -> None:
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
+    skip_roundtrip = bool(int(os.environ.get("SKIP_ROUNDTRIP", "0")))
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    if USE_ZSTD:
-        decompressed = zstd.ZstdDecompressor().decompress(quant_blob_disk)
+    if skip_roundtrip:
+        log0("SKIP_ROUNDTRIP=1 — skipping post-quant roundtrip eval")
+        q_val_loss, q_val_bpb = float("nan"), float("nan")
     else:
-        decompressed = zlib.decompress(quant_blob_disk)
-    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    load_export_state_dict_into_model(base_model, dequantize_state_dict_int8(quant_state))
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        if USE_ZSTD:
+            decompressed = zstd.ZstdDecompressor().decompress(quant_blob_disk)
+        else:
+            decompressed = zlib.decompress(quant_blob_disk)
+        quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
+        load_export_state_dict_into_model(base_model, dequantize_state_dict_int8(quant_state))
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if master_process and args.eval_stride > 0:
         torch.cuda.synchronize()

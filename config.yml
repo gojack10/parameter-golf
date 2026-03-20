@@ -107,5 +107,10 @@ improvements:
   - commit: pending
     bpb_delta: TBD
     description: "Consensus stack: int6+zstd+MLP3x+fp16embed+train@2048+tuned hparams"
+  - commit: bb2c4f8
+    bpb_delta: -0.002
+    description: "TTT eval-time per-document adaptation (50/50 split, lr=0.5, K=1, docs>2048)"
+    hardware_validated: "RTX 4090 (experiment): -0.00649 CE suffix delta on XXL docs"
+    needs_h100_validation: true
     hardware_validated: ""
     needs_h100_validation: true

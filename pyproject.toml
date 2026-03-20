@@ -14,6 +14,7 @@ dependencies = [
     "tiktoken",
     "sentencepiece",
     "liger-kernel>=0.7.0",
+    "zstandard>=0.25.0",
 ]
 
 [[tool.uv.index]]

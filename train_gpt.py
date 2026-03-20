@@ -1423,36 +1423,41 @@ def main() -> None:
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
+    skip_roundtrip = bool(int(os.environ.get("SKIP_ROUNDTRIP", "0")))
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    if USE_ZSTD:
-        decompressed = zstd.ZstdDecompressor().decompress(quant_blob_disk)
+    if skip_roundtrip:
+        log0("SKIP_ROUNDTRIP=1 — skipping post-quant roundtrip eval")
+        q_val_loss, q_val_bpb = float("nan"), float("nan")
     else:
-        decompressed = zlib.decompress(quant_blob_disk)
-    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    load_export_state_dict_into_model(base_model, dequantize_state_dict_int8(quant_state))
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        if USE_ZSTD:
+            decompressed = zstd.ZstdDecompressor().decompress(quant_blob_disk)
+        else:
+            decompressed = zlib.decompress(quant_blob_disk)
+        quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
+        load_export_state_dict_into_model(base_model, dequantize_state_dict_int8(quant_state))
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if master_process and args.eval_stride > 0:
         torch.cuda.synchronize()

@@ -579,11 +579,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         if LATE_K_FP16 and LATE_K_LAYERS > 0 and name.endswith("c_k.weight"):
-            num_layers_total = (
+            num_physical = (
                 max((int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")), default=-1) + 1
             )
-            if num_layers_total > 0 and any(
-                f"blocks.{i}." in name for i in range(num_layers_total - LATE_K_LAYERS, num_layers_total)
+            num_virtual = int(os.environ.get("NUM_LAYERS", num_physical))
+            late_physical = {i % num_physical for i in range(num_virtual - LATE_K_LAYERS, num_virtual)}
+            if num_physical > 0 and any(
+                f"blocks.{i}." in name for i in late_physical
             ):
                 passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
                 kept = t.to(dtype=torch.float16).contiguous()

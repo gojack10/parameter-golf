@@ -1478,6 +1478,10 @@ def main() -> None:
             bytes_code=code_bytes, model_params=n_params,
         )
 
+    if master_process:
+        import checkpoints
+        checkpoints.save_checkpoint(args.run_id)
+
     if distributed:
         dist.destroy_process_group()
 

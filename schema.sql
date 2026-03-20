@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS step_profiles (
 );
 
 -- ============================================================
+-- KERNEL_PROFILES — per-run CUDA kernel timing summary
+-- Source: "kernels" events in JSONL (emitted when PROFILE_KERNELS=1)
+-- Captures torch.profiler key_averages() for a window of steps after warmup.
+-- Enables: cross-run kernel-level comparison, bottleneck identification
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS kernel_profiles (
+    run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    kernel_name TEXT NOT NULL,
+    calls       INTEGER,
+    cuda_time_us REAL,
+    cpu_time_us  REAL,
+    pct_cuda    REAL,
+    PRIMARY KEY (run_id, kernel_name)
+);
+
+-- ============================================================
 -- KERNEL_BENCHMARKS — isolated kernel performance measurements
 -- Source: benchmark script JSON output
 -- Stores both the candidate AND its baseline for self-contained comparison
@@ -233,6 +250,25 @@ SELECT
     notes
 FROM runs;
 
+-- Kernel diff: compare kernel timings between two runs
+-- Usage: SELECT * FROM v_kernel_diff WHERE run_a = ? AND run_b = ?
+CREATE VIEW IF NOT EXISTS v_kernel_diff AS
+SELECT
+    a.kernel_name,
+    a.run_id AS run_a,
+    b.run_id AS run_b,
+    ROUND(a.cuda_time_us, 1) AS cuda_a_us,
+    ROUND(b.cuda_time_us, 1) AS cuda_b_us,
+    ROUND(b.cuda_time_us - a.cuda_time_us, 1) AS delta_us,
+    ROUND(a.pct_cuda, 2) AS pct_a,
+    ROUND(b.pct_cuda, 2) AS pct_b,
+    a.calls AS calls_a,
+    b.calls AS calls_b
+FROM kernel_profiles a
+JOIN kernel_profiles b USING (kernel_name)
+WHERE a.run_id != b.run_id
+ORDER BY delta_us DESC;
+
 -- ============================================================
 -- EXAMPLE AGENT QUERIES
 -- ============================================================
@@ -279,3 +315,14 @@ FROM runs;
 --   -- 3. Estimate wall-time savings:
 --   --    saved_ms_per_step = section_avg_ms * (1 - 1/speedup)
 --   --    total_steps_gained = saved_ms_per_step * steps / step_avg_ms
+--
+-- "Why is run B slower than run A?" (kernel-level diff)
+--   SELECT kernel_name, cuda_a_us, cuda_b_us, delta_us, pct_a, pct_b
+--   FROM v_kernel_diff
+--   WHERE run_a = ? AND run_b = ?
+--   ORDER BY delta_us DESC LIMIT 20;
+--
+-- "Top kernels by CUDA time for a run"
+--   SELECT kernel_name, cuda_time_us, pct_cuda, calls
+--   FROM kernel_profiles WHERE run_id = ?
+--   ORDER BY cuda_time_us DESC LIMIT 20;

@@ -90,6 +90,7 @@ TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
 
 # --- Profiling ---
 PROFILE_SECTIONS: 0
+PROFILE_KERNELS: 0
 
 # --- Early Stopping ---
 EARLY_STOP: 1

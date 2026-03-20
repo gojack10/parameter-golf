@@ -105,6 +105,7 @@ def save_checkpoint(
         smeargate_enabled=args.smeargate_enabled,
         mtp_num_heads=0,  # MTP heads stripped from export
         mtp_loss_weight=0.0,
+        num_unique_layers=args.num_unique_layers,
     )
     eval_defaults = dict(
         train_seq_len=args.train_seq_len,

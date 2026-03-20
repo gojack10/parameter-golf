@@ -67,6 +67,117 @@ class StepProfiler:
         self._marks.clear()
 
 
+class KernelProfiler:
+    """torch.profiler-based CUDA kernel profiling for a window of training steps.
+
+    Captures detailed kernel-level timing (every CUDA kernel launch) for a
+    configurable window of steps after compile warmup. Exports:
+    1. key_averages() summary -> JSONL "kernels" event -> SQLite kernel_profiles table
+    2. Chrome trace JSON -> logs/{run_id}_kernels.json (for visual inspection)
+
+    Usage in training loop:
+        kp = KernelProfiler(enabled=True, run_id="abc", start_step=20, num_steps=5)
+
+        for step in range(total_steps):
+            kp.step_begin(step)
+            # ... training step ...
+            kp.step_end(step)
+
+        # After training, get results:
+        summary = kp.finish()  # returns list of kernel dicts, exports chrome trace
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        run_id: str = "",
+        log_dir: str = "logs",
+        start_step: int = 20,
+        num_steps: int = 5,
+    ):
+        self.enabled = enabled
+        self.run_id = run_id
+        self.log_dir = log_dir
+        self.start_step = start_step
+        self.end_step = start_step + num_steps
+        self._profiler = None
+        self._active = False
+        self._finished = False
+        self._summary: list[dict] = []
+
+    def step_begin(self, step: int) -> None:
+        """Call at the start of each training step."""
+        if not self.enabled or self._finished:
+            return
+        if step == self.start_step:
+            # Start profiling
+            from torch.profiler import profile, ProfilerActivity
+            self._profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=False,
+            )
+            self._profiler.__enter__()
+            self._active = True
+
+    def step_end(self, step: int) -> None:
+        """Call at the end of each training step."""
+        if not self.enabled or not self._active or self._finished:
+            return
+        if step >= self.end_step - 1:
+            # Stop profiling and collect results
+            self._profiler.__exit__(None, None, None)
+            self._active = False
+            self._finished = True
+            self._collect()
+
+    def _collect(self) -> None:
+        """Extract key_averages and export chrome trace."""
+        if self._profiler is None:
+            return
+
+        # Export chrome trace
+        trace_path = os.path.join(self.log_dir, f"{self.run_id}_kernels.json")
+        try:
+            self._profiler.export_chrome_trace(trace_path)
+        except Exception:
+            pass  # Best-effort
+
+        # Extract key_averages
+        # PyTorch 2.x uses device_time_total; older uses cuda_time_total
+        def _cuda_us(e: object) -> float:
+            for attr in ("cuda_time_total", "device_time_total", "self_cuda_time_total", "self_device_time_total"):
+                v = getattr(e, attr, None)
+                if v is not None and v > 0:
+                    return float(v)
+            return 0.0
+
+        ka = self._profiler.key_averages()
+        total_cuda = sum(_cuda_us(e) for e in ka)
+
+        for entry in sorted(ka, key=_cuda_us, reverse=True):
+            cuda_us = _cuda_us(entry)
+            if cuda_us <= 0:
+                continue
+            self._summary.append({
+                "kernel_name": entry.key,
+                "calls": entry.count,
+                "cuda_time_us": cuda_us,
+                "cpu_time_us": getattr(entry, "cpu_time_total", 0),
+                "pct_cuda": round(100.0 * cuda_us / max(total_cuda, 1), 4),
+            })
+
+    def finish(self) -> list[dict]:
+        """Return kernel summary. Safe to call multiple times."""
+        # If profiler is still active (e.g. training ended early), stop it
+        if self._active and self._profiler is not None:
+            self._profiler.__exit__(None, None, None)
+            self._active = False
+            self._finished = True
+            self._collect()
+        return self._summary
+
+
 class RunMonitor:
     """Tracks a training run: emits JSONL, checks early-stop conditions."""
 
@@ -247,6 +358,20 @@ class RunMonitor:
             "t": "profile", "s": step,
             **{k: round(v, 3) for k, v in sections.items()},
             "total": round(sum(sections.values()), 3),
+        })
+
+    # ------------------------------------------------------------------
+    # Kernel profile logging  (call after KernelProfiler.finish())
+    # ------------------------------------------------------------------
+
+    def log_kernels(self, kernels: list[dict]) -> None:
+        """Emit kernel profile summary as a JSONL event."""
+        if not kernels:
+            return
+        self._write({
+            "t": "kernels",
+            "run_id": self.run_id,
+            "entries": kernels,
         })
 
     # ------------------------------------------------------------------

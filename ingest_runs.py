@@ -35,7 +35,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
     """Ingest a single JSONL file. Returns counts of events ingested by type."""
-    counts: dict[str, int] = {"config": 0, "val": 0, "train": 0, "profile": 0, "final": 0}
+    counts: dict[str, int] = {"config": 0, "val": 0, "train": 0, "profile": 0, "kernels": 0, "final": 0}
     config_data: dict = {}
 
     events = []
@@ -172,6 +172,23 @@ def ingest_jsonl(conn: sqlite3.Connection, jsonl_path: Path) -> dict[str, int]:
                     )
             counts["profile"] += 1
 
+        elif t == "kernels":
+            for entry in ev.get("entries", []):
+                conn.execute(
+                    """INSERT OR REPLACE INTO kernel_profiles
+                       (run_id, kernel_name, calls, cuda_time_us, cpu_time_us, pct_cuda)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        entry.get("kernel_name"),
+                        entry.get("calls"),
+                        entry.get("cuda_time_us"),
+                        entry.get("cpu_time_us"),
+                        entry.get("pct_cuda"),
+                    ),
+                )
+            counts["kernels"] += 1
+
     return counts
 
 
@@ -231,7 +248,7 @@ def main() -> None:
 
     # Ingest JSONL logs
     jsonl_files = [Path(f) for f in args.files] if args.files else sorted(Path(LOGS_DIR).glob("*.jsonl"))
-    total = {"config": 0, "val": 0, "train": 0, "profile": 0, "final": 0}
+    total = {"config": 0, "val": 0, "train": 0, "profile": 0, "kernels": 0, "final": 0}
     for jf in jsonl_files:
         if not jf.exists():
             print(f"skip: {jf} (not found)")
@@ -256,7 +273,7 @@ def main() -> None:
     conn.close()
 
     print(f"\ntotal: {sum(total.values())} events from {len(jsonl_files)} log(s), {bench_count} benchmark(s)")
-    print(f"  runs: {total['final']}, val: {total['val']}, profile: {total['profile']}")
+    print(f"  runs: {total['final']}, val: {total['val']}, profile: {total['profile']}, kernels: {total['kernels']}")
     print(f"db: {args.db}")
 
 

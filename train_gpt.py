@@ -84,6 +84,7 @@ class Hyperparameters:
     early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", "3"))
 
     profile_sections = bool(int(os.environ.get("PROFILE_SECTIONS", "0")))
+    profile_kernels = bool(int(os.environ.get("PROFILE_KERNELS", "0")))
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
 
@@ -1163,8 +1164,11 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    from observability import RunMonitor, StepProfiler
+    from observability import RunMonitor, StepProfiler, KernelProfiler
     profiler = StepProfiler(enabled=args.profile_sections) if master_process else None
+    kernel_profiler = KernelProfiler(
+        enabled=args.profile_kernels, run_id=args.run_id,
+    ) if master_process else None
     if master_process and args.profile_sections:
         log0("profile_sections:enabled (CUDA event timing on logged steps)")
     monitor = RunMonitor(
@@ -1286,6 +1290,8 @@ def main() -> None:
         do_profile = profiler is not None and will_log
         if do_profile:
             profiler.mark("data")
+        if kernel_profiler is not None:
+            kernel_profiler.step_begin(next_step)
 
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1322,6 +1328,8 @@ def main() -> None:
 
         if do_profile:
             profiler.mark("end")
+        if kernel_profiler is not None:
+            kernel_profiler.step_end(next_step)
 
         step += 1
 
@@ -1361,6 +1369,12 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if kernel_profiler is not None:
+        kernel_summary = kernel_profiler.finish()
+        if kernel_summary and monitor:
+            monitor.log_kernels(kernel_summary)
+            log0(f"kernel_profile: {len(kernel_summary)} kernels captured, trace at logs/{args.run_id}_kernels.json")
 
     if swa_checkpoints:
         log0(f"swa:averaging {len(swa_checkpoints)} checkpoints")

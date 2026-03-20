@@ -54,6 +54,7 @@ class Hyperparameters:
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", "0"))  # 0 = disabled
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -290,12 +291,12 @@ def get_logits(base_model: nn.Module, input_ids: Tensor) -> Tensor:
     x0 = x
     skips: list[Tensor] = []
     for i in range(base_model.num_encoder_layers):
-        x = base_model.blocks[i](x, x0)
+        x = base_model.blocks[i % base_model.num_physical_blocks](x, x0)
         skips.append(x)
     for i in range(base_model.num_decoder_layers):
         if skips:
             x = x + base_model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-        x = base_model.blocks[base_model.num_encoder_layers + i](x, x0)
+        x = base_model.blocks[(base_model.num_encoder_layers + i) % base_model.num_physical_blocks](x, x0)
     x = base_model.final_norm(x)
     if base_model.tie_embeddings:
         logits_proj = F.linear(x, base_model.tok_emb.weight)
@@ -885,6 +886,7 @@ class GPT(nn.Module):
         smeargate_enabled: bool = False,
         mtp_num_heads: int = 0,
         mtp_loss_weight: float = 0.1,
+        num_unique_layers: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -900,6 +902,8 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        num_physical = num_unique_layers if num_unique_layers > 0 else num_layers
+        self.num_physical_blocks = num_physical
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -910,7 +914,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_physical)
             ]
         )
         self.final_norm = RMSNorm()
@@ -940,12 +944,12 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_physical_blocks](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[(self.num_encoder_layers + i) % self.num_physical_blocks](x, x0)
 
         x = self.final_norm(x)
         _, seqlen, dim = x.shape
@@ -1089,6 +1093,7 @@ def main() -> None:
         smeargate_enabled=args.smeargate_enabled,
         mtp_num_heads=args.mtp_num_heads,
         mtp_loss_weight=args.mtp_loss_weight,
+        num_unique_layers=args.num_unique_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

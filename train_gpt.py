@@ -18,6 +18,8 @@ try:
 except ImportError:
     _ZSTD_AVAILABLE = False
 _COMPRESSOR = os.environ.get("COMPRESSOR", "zstd")
+if _COMPRESSOR == "zstd" and not _ZSTD_AVAILABLE:
+    raise ImportError("COMPRESSOR=zstd but zstandard is not installed. Run: uv add zstandard")
 USE_ZSTD = _ZSTD_AVAILABLE and _COMPRESSOR != "zlib"
 from pathlib import Path
 

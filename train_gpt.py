@@ -533,7 +533,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     qmax = float(QUANT_MAX)
     if t32.ndim == 2:
         clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            t32.abs().amax(dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
@@ -542,7 +542,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         q = torch.clamp(torch.round(clipped / scale[:, None]), -QUANT_MAX, QUANT_MAX).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    clip_abs = float(t32.abs().amax().item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -QUANT_MAX, QUANT_MAX).to(torch.int8).contiguous()
     return q, scale
@@ -723,7 +723,7 @@ class CastedLinear(nn.Linear):
         if _QAT_ENABLED and self.training and self.weight.ndim == 2:
             w32 = self.weight.float()
             qmax = float(QUANT_MAX)
-            clip_abs = torch.quantile(w32.abs(), INT8_CLIP_Q, dim=1)
+            clip_abs = w32.abs().amax(dim=1)
             scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
             w_q = torch.clamp(torch.round(w32 / scale[:, None]), -QUANT_MAX, QUANT_MAX) * scale[:, None]
             w = w + (w_q.to(x.dtype) - w).detach()

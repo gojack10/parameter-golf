@@ -99,6 +99,10 @@ class Hyperparameters:
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", "1"))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", "0.1"))
 
+    # Training checkpoint save/resume
+    checkpoint_save_at = os.environ.get("CHECKPOINT_SAVE_AT", "")  # comma-separated wall-time seconds
+    resume_from = os.environ.get("RESUME_FROM", "")  # path to training checkpoint
+
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -858,6 +862,39 @@ def load_export_state_dict_into_model(model: nn.Module, state_dict: dict[str, Te
         raise RuntimeError(f"Missing non-MTP keys: {non_mtp_missing}")
 
 
+def save_training_state(
+    path: str,
+    base_model: nn.Module,
+    optimizers: list[torch.optim.Optimizer],
+    step: int,
+    training_time_ms: float,
+    args: Hyperparameters,
+    swa_checkpoints: list[dict[str, Tensor]],
+    swa_collecting: bool,
+) -> None:
+    """Save full training state for resume."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        dict(
+            model_state_dict=base_model.state_dict(),
+            optimizer_states=[opt.state_dict() for opt in optimizers],
+            step=step,
+            training_time_ms=training_time_ms,
+            swa_checkpoints=swa_checkpoints,
+            swa_collecting=swa_collecting,
+            rng_torch=torch.random.get_rng_state(),
+            rng_cuda=torch.cuda.get_rng_state(),
+            args=vars(args),
+        ),
+        path,
+    )
+
+
+def load_training_state(path: str, device: torch.device) -> dict:
+    """Load a training checkpoint. Returns the saved state dict."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -1013,6 +1050,25 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    # ── Resume from training checkpoint ──────────────────────────────────
+    resume_step = 0
+    resume_time_ms = 0.0
+    resume_swa_checkpoints: list[dict[str, Tensor]] = []
+    resume_swa_collecting = False
+    if args.resume_from:
+        log0(f"resume:loading {args.resume_from}")
+        ckpt = load_training_state(args.resume_from, device)
+        base_model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        for opt, opt_state in zip(optimizers, ckpt["optimizer_states"], strict=True):
+            opt.load_state_dict(opt_state)
+        resume_step = ckpt["step"]
+        resume_time_ms = ckpt["training_time_ms"]
+        resume_swa_checkpoints = ckpt.get("swa_checkpoints", [])
+        resume_swa_collecting = ckpt.get("swa_collecting", False)
+        torch.random.set_rng_state(ckpt["rng_torch"])
+        torch.cuda.set_rng_state(ckpt["rng_cuda"].to("cpu"))
+        log0(f"resume:restored step={resume_step} wall={resume_time_ms:.0f}ms swa_ckpts={len(resume_swa_checkpoints)}")
+
     n_params = sum(p.numel() for p in base_model.parameters())
     n_mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params} mtp_params:{n_mtp_params} export_params:{n_params - n_mtp_params}")
@@ -1071,7 +1127,7 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    if args.warmup_steps > 0:
+    if args.warmup_steps > 0 and not args.resume_from:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1097,15 +1153,24 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    swa_checkpoints: list[dict[str, Tensor]] = []
-    swa_collecting = False
+    swa_checkpoints: list[dict[str, Tensor]] = resume_swa_checkpoints
+    swa_collecting = resume_swa_collecting
 
-    training_time_ms = 0.0
+    training_time_ms = resume_time_ms
     stop_after_step: int | None = None
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    step = 0
+    # Parse checkpoint save thresholds (wall-time seconds)
+    _save_thresholds_s = [float(x.strip()) for x in args.checkpoint_save_at.split(",") if x.strip()]
+    _save_thresholds_ms = sorted(t * 1000.0 for t in _save_thresholds_s)
+    _next_save_idx = 0
+    # Skip thresholds already passed on resume
+    while _next_save_idx < len(_save_thresholds_ms) and _save_thresholds_ms[_next_save_idx] <= training_time_ms:
+        _next_save_idx += 1
+
+    step = resume_step
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1208,6 +1273,30 @@ def main() -> None:
             log0(f"swa:checkpoint step:{step} count:{len(swa_checkpoints)}")
 
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+
+        # ── Training checkpoint save ─────────────────────────────────────
+        if (
+            master_process
+            and _next_save_idx < len(_save_thresholds_ms)
+            and approx_training_time_ms >= _save_thresholds_ms[_next_save_idx]
+        ):
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_path = f"checkpoints/train_{args.run_id}_step{step}.pt"
+            log0(f"checkpoint:saving step={step} wall={approx_training_time_ms:.0f}ms -> {ckpt_path}")
+            # Sync training_time_ms so the saved value is accurate
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            save_training_state(
+                ckpt_path, base_model, optimizers, step, training_time_ms, args,
+                swa_checkpoints, swa_collecting,
+            )
+            log0(f"checkpoint:saved {ckpt_path} ({os.path.getsize(ckpt_path) / (1024*1024):.1f} MiB)")
+            _next_save_idx += 1
+            # Reset t0 so we don't double-count the save time
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            approx_training_time_ms = training_time_ms
+
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)

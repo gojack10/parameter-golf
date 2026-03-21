@@ -124,6 +124,7 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, beta2=beta2),
         )
+        self._updates_flat = None  # lazily allocated on first step
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -147,7 +148,11 @@ class Muon(torch.optim.Optimizer):
             beta2 = group["beta2"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            if self._updates_flat is None or self._updates_flat.numel() != total_params:
+                self._updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            else:
+                self._updates_flat.zero_()
+            updates_flat = self._updates_flat
 
             curr = 0
             for i, p in enumerate(params):
@@ -1019,12 +1024,13 @@ def main() -> None:
     if base_model.smear is not None:
         scalar_params.append(base_model.smear.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
+    adam_param_groups = [
+        {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr},
+        {"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr},
+    ]
+    if base_model.lm_head is not None:
+        adam_param_groups.append({"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr})
+    optimizer_adam = torch.optim.Adam(adam_param_groups, betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -1034,21 +1040,7 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
+    optimizers: list[torch.optim.Optimizer] = [optimizer_adam, optimizer_muon]
 
     # ── Resume from training checkpoint ──────────────────────────────────
     resume_step = 0

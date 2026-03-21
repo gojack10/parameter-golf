@@ -9,10 +9,6 @@ Usage:
 
     # Eval-only on a saved checkpoint
     uv run python checkpoints.py eval --checkpoint checkpoints/my_run.pt --eval-stride 64
-
-    # Eval with TTT
-    uv run python checkpoints.py eval --checkpoint checkpoints/my_run.pt --eval-stride 256 \
-        --ttt --ttt-lr 0.5 --ttt-min-doc-len 2048 --ttt-split-frac 0.5
 """
 from __future__ import annotations
 
@@ -110,10 +106,6 @@ def save_checkpoint(
     eval_defaults = dict(
         train_seq_len=args.train_seq_len,
         eval_stride=args.eval_stride,
-        ttt_enabled=args.ttt_enabled,
-        ttt_lr=args.ttt_lr,
-        ttt_min_doc_len=args.ttt_min_doc_len,
-        ttt_split_frac=args.ttt_split_frac,
         tokenizer_path=args.tokenizer_path,
         data_path=args.data_path,
     )
@@ -175,10 +167,6 @@ def load_checkpoint(
 def run_eval(
     ckpt_path: str,
     eval_stride: int | None = None,
-    ttt: bool | None = None,
-    ttt_lr: float | None = None,
-    ttt_min_doc_len: int | None = None,
-    ttt_split_frac: float | None = None,
     seq_len: int | None = None,
     batch_size: int = 32,
     device: str = "cuda",
@@ -193,18 +181,12 @@ def run_eval(
     # Merge explicit args with checkpoint defaults
     seq_len = seq_len or eval_defaults["train_seq_len"]
     stride = eval_stride if eval_stride is not None else eval_defaults.get("eval_stride", 256)
-    use_ttt = ttt if ttt is not None else eval_defaults.get("ttt_enabled", False)
-    lr = ttt_lr if ttt_lr is not None else eval_defaults.get("ttt_lr", 0.5)
-    min_doc = ttt_min_doc_len if ttt_min_doc_len is not None else eval_defaults.get("ttt_min_doc_len", 2048)
-    split_frac = ttt_split_frac if ttt_split_frac is not None else eval_defaults.get("ttt_split_frac", 0.5)
 
     tokenizer_path = eval_defaults.get("tokenizer_path", "./data/tokenizers/fineweb_1024_bpe.model")
     data_path = eval_defaults.get("data_path", "./data/datasets/fineweb10B_sp1024")
     val_pattern = os.path.join(data_path, "fineweb_val_*.bin")
 
-    print(f"Config: seq_len={seq_len} stride={stride} ttt={use_ttt}")
-    if use_ttt:
-        print(f"  TTT: lr={lr} min_doc_len={min_doc} split_frac={split_frac}")
+    print(f"Config: seq_len={seq_len} stride={stride}")
 
     # Load tokenizer + LUTs
     sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
@@ -222,20 +204,11 @@ def run_eval(
     t0 = time.perf_counter()
 
     if stride > 0:
-        if use_ttt:
-            val_loss, val_bpb, n_ttt = tg.eval_val_ttt(
-                model, seq_len, stride, dev, val_tokens,
-                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                ttt_lr=lr, ttt_min_doc_len=min_doc, ttt_split_frac=split_frac,
-                sw_batch_size=batch_size,
-            )
-        else:
-            val_loss, val_bpb = tg.eval_val_sliding(
-                model, seq_len, stride, dev, val_tokens,
-                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                batch_size=batch_size,
-            )
-            n_ttt = 0
+        val_loss, val_bpb = tg.eval_val_sliding(
+            model, seq_len, stride, dev, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            batch_size=batch_size,
+        )
     else:
         # Non-sliding eval (stride=0 means standard chunked eval)
         args = tg.Hyperparameters()
@@ -243,7 +216,6 @@ def run_eval(
             args, model, 0, 1, dev, 1,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
-        n_ttt = 0
 
     torch.cuda.synchronize()
     elapsed_ms = 1000.0 * (time.perf_counter() - t0)
@@ -253,17 +225,12 @@ def run_eval(
         val_bpb=val_bpb,
         eval_time_ms=elapsed_ms,
         stride=stride,
-        ttt=use_ttt,
     )
-    if use_ttt:
-        results["n_ttt_docs"] = n_ttt
 
     print(f"\nResults:")
     print(f"  val_loss:  {val_loss:.8f}")
     print(f"  val_bpb:   {val_bpb:.8f}")
     print(f"  eval_time: {elapsed_ms:.0f}ms")
-    if use_ttt:
-        print(f"  ttt_docs:  {n_ttt}")
 
     return results
 
@@ -288,11 +255,6 @@ def main():
     p_eval.add_argument("--eval-stride", type=int, default=None, help="Sliding window stride (0 = standard eval)")
     p_eval.add_argument("--seq-len", type=int, default=None, help="Sequence length (default: from checkpoint)")
     p_eval.add_argument("--batch-size", type=int, default=32, help="Sliding window batch size")
-    p_eval.add_argument("--ttt", action="store_true", default=None, help="Enable test-time training")
-    p_eval.add_argument("--no-ttt", action="store_false", dest="ttt", help="Disable test-time training")
-    p_eval.add_argument("--ttt-lr", type=float, default=None)
-    p_eval.add_argument("--ttt-min-doc-len", type=int, default=None)
-    p_eval.add_argument("--ttt-split-frac", type=float, default=None)
     p_eval.add_argument("--device", default="cuda")
 
     # --- info ---
@@ -308,10 +270,6 @@ def main():
         run_eval(
             parsed.checkpoint,
             eval_stride=parsed.eval_stride,
-            ttt=parsed.ttt,
-            ttt_lr=parsed.ttt_lr,
-            ttt_min_doc_len=parsed.ttt_min_doc_len,
-            ttt_split_frac=parsed.ttt_split_frac,
             seq_len=parsed.seq_len,
             batch_size=parsed.batch_size,
             device=parsed.device,

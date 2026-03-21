@@ -89,11 +89,6 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
 
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_lr = float(os.environ.get("TTT_LR", "0.5"))
-    ttt_min_doc_len = int(os.environ.get("TTT_MIN_DOC_LEN", "2048"))
-    ttt_split_frac = float(os.environ.get("TTT_SPLIT_FRAC", "0.5"))
-
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     normuon_beta2 = float(os.environ.get("NORMUON_BETA2", "0.0"))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
@@ -352,141 +347,6 @@ def eval_val_sliding(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = float(valid.sum().item()) / float(token_bytes.to(torch.float64).sum().item())
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def eval_val_ttt(
-    base_model: nn.Module,
-    seq_len: int,
-    stride: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    ttt_lr: float = 0.5,
-    ttt_min_doc_len: int = 2048,
-    ttt_split_frac: float = 0.5,
-    sw_batch_size: int = 32,
-) -> tuple[float, float, int]:
-    """Sliding window eval + test-time training on long documents.
-
-    Phase 1: Standard sliding window to get per-token best losses.
-    Phase 2: For each doc >= ttt_min_doc_len, adapt model on prefix via
-             one SGD step, then score suffix. Update per-token losses
-             where TTT improves over sliding window (min merge).
-    Phase 3: Compute BPB from the merged per-token losses.
-
-    Returns (val_loss, val_bpb, n_ttt_docs).
-    """
-    total_tokens = val_tokens.numel() - 1
-
-    # --- Phase 1: Sliding window per-token losses ---
-    best_loss = torch.full((total_tokens,), float("inf"), dtype=torch.float64)
-    base_model.eval()
-    window_starts = list(range(0, total_tokens - seq_len + 1, stride))
-    with torch.inference_mode():
-        for batch_start in range(0, len(window_starts), sw_batch_size):
-            batch_starts = window_starts[batch_start : batch_start + sw_batch_size]
-            xs, ys = [], []
-            for start in batch_starts:
-                local = val_tokens[start : start + seq_len + 1].to(dtype=torch.int64)
-                xs.append(local[:-1])
-                ys.append(local[1:])
-            x = torch.stack(xs).to(device, non_blocking=True)
-            y = torch.stack(ys).to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = get_logits(base_model, x)
-            per_token = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none"
-            ).reshape(len(batch_starts), seq_len).to(torch.float64).cpu()
-            for i, start in enumerate(batch_starts):
-                best_loss[start : start + seq_len] = torch.minimum(
-                    best_loss[start : start + seq_len], per_token[i]
-                )
-
-    # --- Phase 2: TTT on long documents ---
-    BOS_ID = 1
-    bos_positions = (val_tokens == BOS_ID).nonzero(as_tuple=True)[0].tolist()
-    bos_positions.append(val_tokens.numel())  # sentinel for last doc
-
-    base_state = {n: p.data.clone() for n, p in base_model.named_parameters()}
-    n_ttt_docs = 0
-
-    for i in range(len(bos_positions) - 1):
-        doc_start = bos_positions[i]
-        doc_end = bos_positions[i + 1]
-        doc_len = doc_end - doc_start
-        if doc_len < ttt_min_doc_len:
-            continue
-
-        split_idx = int(doc_len * ttt_split_frac)
-        if split_idx < 64 or doc_len - split_idx < 64:
-            continue
-
-        # Adapt: one SGD step on prefix
-        prefix = val_tokens[doc_start : doc_start + split_idx]
-        px = prefix[:-1].unsqueeze(0).to(device=device, dtype=torch.int64)
-        py = prefix[1:].unsqueeze(0).to(device=device, dtype=torch.int64)
-
-        for p in base_model.parameters():
-            p.requires_grad_(True)
-        optimizer = torch.optim.SGD(base_model.parameters(), lr=ttt_lr)
-        base_model.train()
-        optimizer.zero_grad()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            adapt_logits = get_logits(base_model, px)
-            adapt_loss = F.cross_entropy(
-                adapt_logits.reshape(-1, adapt_logits.size(-1)).float(),
-                py.reshape(-1),
-                reduction="mean",
-            )
-        adapt_loss.backward()
-        nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
-        optimizer.step()
-
-        # Score full document with adapted model, update suffix positions
-        base_model.eval()
-        doc = val_tokens[doc_start:doc_end]
-        dx = doc[:-1].unsqueeze(0).to(device=device, dtype=torch.int64)
-        dy = doc[1:].to(device=device, dtype=torch.int64)
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            doc_logits = get_logits(base_model, dx)
-        doc_per_token = F.cross_entropy(
-            doc_logits.squeeze(0).float(), dy, reduction="none"
-        ).to(torch.float64).cpu()
-
-        # Merge: update best_loss for suffix positions only (causal split)
-        # doc_per_token[j] predicts val_tokens[doc_start + j + 1], maps to best_loss[doc_start + j]
-        suffix_local_start = split_idx - 1
-        global_start = doc_start + suffix_local_start
-        global_end = min(doc_start + len(doc_per_token), total_tokens)
-        local_end = global_end - doc_start
-        ttt_suffix = doc_per_token[suffix_local_start:local_end]
-        best_loss[global_start:global_end] = torch.minimum(
-            best_loss[global_start:global_end], ttt_suffix
-        )
-
-        # Restore base weights
-        with torch.no_grad():
-            for n, p in base_model.named_parameters():
-                p.data.copy_(base_state[n])
-                p.requires_grad_(False)
-        n_ttt_docs += 1
-
-    del base_state
-
-    # --- Phase 3: Compute BPB from merged per-token losses ---
-    valid = best_loss < float("inf")
-    prev_ids = val_tokens[:-1][valid].to(dtype=torch.int64, device=device)
-    tgt_ids = val_tokens[1:][valid].to(dtype=torch.int64, device=device)
-    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-    token_bytes += (
-        has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
-    ).to(dtype=torch.int16)
-    val_loss = best_loss[valid].sum() / valid.sum()
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = float(valid.sum().item()) / float(token_bytes.to(torch.float64).sum().item())
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte), n_ttt_docs
 
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -1463,35 +1323,19 @@ def main() -> None:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
         restore_low_dim_params_to_fp32(base_model)
-        if args.ttt_enabled:
-            sq_val_loss, sq_val_bpb, n_ttt = eval_val_ttt(
-                base_model, args.train_seq_len, args.eval_stride, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                ttt_lr=args.ttt_lr, ttt_min_doc_len=args.ttt_min_doc_len,
-                ttt_split_frac=args.ttt_split_frac,
-            )
-            torch.cuda.synchronize()
-            log0(
-                f"ttt_sliding_eval stride:{args.eval_stride} ttt_docs:{n_ttt} "
-                f"val_loss:{sq_val_loss:.4f} val_bpb:{sq_val_bpb:.4f} "
-                f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms "
-                f"delta_bpb:{sq_val_bpb - q_val_bpb:.6f}"
-            )
-            log0(f"ttt_sliding_eval_exact val_loss:{sq_val_loss:.8f} val_bpb:{sq_val_bpb:.8f}")
-        else:
-            sq_val_loss, sq_val_bpb = eval_val_sliding(
-                base_model, args.train_seq_len, args.eval_stride, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            )
-            torch.cuda.synchronize()
-            log0(
-                f"sliding_window_eval stride:{args.eval_stride} val_loss:{sq_val_loss:.4f} val_bpb:{sq_val_bpb:.4f} "
-                f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms "
-                f"delta_bpb:{sq_val_bpb - q_val_bpb:.6f}"
-            )
-            log0(f"sliding_window_eval_exact val_loss:{sq_val_loss:.8f} val_bpb:{sq_val_bpb:.8f}")
+        sq_val_loss, sq_val_bpb = eval_val_sliding(
+            base_model, args.train_seq_len, args.eval_stride, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"sliding_window_eval stride:{args.eval_stride} val_loss:{sq_val_loss:.4f} val_bpb:{sq_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms "
+            f"delta_bpb:{sq_val_bpb - q_val_bpb:.6f}"
+        )
+        log0(f"sliding_window_eval_exact val_loss:{sq_val_loss:.8f} val_bpb:{sq_val_bpb:.8f}")
 
-    # Sliding window / TTT results (None if eval_stride disabled or not master)
+    # Sliding window results (None if eval_stride disabled or not master)
     sw_loss = sq_val_loss if (master_process and args.eval_stride > 0) else None
     sw_bpb = sq_val_bpb if (master_process and args.eval_stride > 0) else None
 

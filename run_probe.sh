@@ -54,9 +54,10 @@ load_config() {
 preset_3070() {
     export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-300}"
     export ITERATIONS="${ITERATIONS:-5000}"
-    export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-65536}"
+    export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-32768}"
     export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-250}"
     export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-100}"
+    export EVAL_STRIDE="${EVAL_STRIDE:-0}"  # sliding window too slow on 3070; use standard eval
     [[ -f reference_bpb_3070.json ]] && export EARLY_STOP_REF="${EARLY_STOP_REF:-reference_bpb_3070.json}"
     TRAIN_CMD="uv run python train_gpt.py"
 }
@@ -151,10 +152,12 @@ if [[ -n "${PROBE_NOTES:-}" ]]; then
     echo "Notes: $PROBE_NOTES"
 fi
 echo "Key env vars:"
-echo "  MATRIX_LR=$MATRIX_LR  SCALAR_LR=$SCALAR_LR  EMBED_LR=$EMBED_LR"
-echo "  MUON_MOMENTUM=$MUON_MOMENTUM  EVAL_STRIDE=$EVAL_STRIDE"
+echo "  NUM_LAYERS=$NUM_LAYERS  MODEL_DIM=$MODEL_DIM  XSA_LAST_N=${XSA_LAST_N:-0}"
+echo "  MATRIX_LR=$MATRIX_LR  SCALAR_LR=$SCALAR_LR  TIED_EMBED_LR=${TIED_EMBED_LR:-}"
+echo "  MUON_WD=${MUON_WD:-0}  ADAM_WD=${ADAM_WD:-0}  EMA_ENABLED=${EMA_ENABLED:-0}"
 echo "  MAX_WALLCLOCK_SECONDS=$MAX_WALLCLOCK_SECONDS  ITERATIONS=$ITERATIONS"
-echo "  TRAIN_BATCH_TOKENS=$TRAIN_BATCH_TOKENS  EARLY_STOP_REF=${EARLY_STOP_REF:-<none>}"
+echo "  TRAIN_BATCH_TOKENS=$TRAIN_BATCH_TOKENS  EVAL_STRIDE=$EVAL_STRIDE"
+echo "  EARLY_STOP_REF=${EARLY_STOP_REF:-<none>}  SKIP_ROUNDTRIP=${SKIP_ROUNDTRIP:-0}"
 echo "===================="
 echo ""
 

@@ -1,17 +1,16 @@
-# Parameter Golf — Consensus Stack Configuration
-# Source of truth for env vars passed to train_gpt.py / train_gpt_mlx.py
-# Updated 2026-03-19: adopted competition-converged settings from 18 PR scrape.
+# Parameter Golf — SOTA Rebase Configuration (PR #315)
+# Source of truth for env vars passed to train_gpt.py
+# Updated 2026-03-22: SOTA rebase from PR #315 (1.1248 BPB, 26.8M params, 11 unique layers)
 # Usage: run_probe.sh reads this and exports all UPPER_CASE keys as env vars.
 
-best_bpb: 1.2244
-best_bpb_prequant: 1.2172
-artifact_bytes: 15863489
+best_bpb: 1.1248
+best_bpb_prequant: 1.1418
+artifact_bytes: 15612308
 artifact_limit: 16000000
 
 # --- Model ---
 VOCAB_SIZE: 1024
-NUM_LAYERS: 9
-NUM_UNIQUE_LAYERS: 3
+NUM_LAYERS: 11
 MODEL_DIM: 512
 NUM_HEADS: 8
 NUM_KV_HEADS: 4
@@ -22,21 +21,28 @@ LOGIT_SOFTCAP: 30.0
 ROPE_BASE: 10000.0
 QK_GAIN_INIT: 1.5
 
+# --- SOTA Architecture Features ---
+XSA_LAST_N: 4
+ROPE_DIMS: 16
+LN_SCALE: 1
+BIGRAM_VOCAB_SIZE: 2048
+BIGRAM_DIM: 128
+
 # --- Training ---
 TRAIN_BATCH_TOKENS: 786432
 TRAIN_SEQ_LEN: 2048
-ITERATIONS: 20000
+ITERATIONS: 9000
 WARMUP_STEPS: 20
 WARMDOWN_ITERS: 3000
 MAX_WALLCLOCK_SECONDS: 600
 SEED: 1337
 
 # --- Optimizer ---
-TIED_EMBED_LR: 0.03
+TIED_EMBED_LR: 0.035
 EMBED_LR: 0.6
 HEAD_LR: 0.008
-MATRIX_LR: 0.02
-SCALAR_LR: 0.02
+MATRIX_LR: 0.025
+SCALAR_LR: 0.025
 MUON_MOMENTUM: 0.99
 MUON_BACKEND_STEPS: 5
 MUON_MOMENTUM_WARMUP_START: 0.92
@@ -45,6 +51,9 @@ BETA1: 0.9
 BETA2: 0.95
 ADAM_EPS: 1.0e-8
 GRAD_CLIP_NORM: 0.3
+MUON_WD: 0.04
+ADAM_WD: 0.04
+MUON_BETA2: 0.95
 
 # --- Validation ---
 VAL_BATCH_SIZE: 524288
@@ -52,32 +61,25 @@ VAL_LOSS_EVERY: 1000
 TRAIN_LOG_EVERY: 200
 
 # --- Sliding Window Eval ---
-EVAL_STRIDE: 0
+EVAL_STRIDE: 64
 
 # --- Quantization / Compression ---
-QUANT_MAX: 31
-COMPRESSOR: zstd
-EMBED_FP16: 1
-LATE_K_FP16: 1
-LATE_K_LAYERS: 2
+# SOTA uses int6 mixed quantization + zstd level 22 (handled in code)
 
-# --- STE QAT (fake int6 quantization during training) ---
-QAT_ENABLED: 1
+# --- STE QAT ---
+QAT_ENABLED: 0
+LATE_QAT: 1
+QAT_THRESHOLD: 0.1
 
-# --- NorMuon (per-row second-moment normalization in Muon) ---
-NORMUON_BETA2: 0.95
-
-# --- SWA (Stochastic Weight Averaging during warmdown) ---
-SWA_ENABLED: 1
-SWA_START_FRAC: 0.5
+# --- EMA (replaces SWA) ---
+EMA_ENABLED: 1
+EMA_DECAY: 0.997
+SWA_ENABLED: 0
 SWA_EVERY: 200
 
-# --- SmearGate (bigram preprocessing, 512 params) ---
-SMEARGATE_ENABLED: 1
-
-# --- MTP (Multi-Token Prediction auxiliary objective) ---
-MTP_NUM_HEADS: 1
-MTP_LOSS_WEIGHT: 0.1
+# --- MTP (Multi-Token Prediction) ---
+MTP_NUM_HEADS: 0
+MTP_LOSS_WEIGHT: 0.2
 
 # --- Data ---
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
@@ -98,15 +100,7 @@ EARLY_STOP_MIN_STEP: 500
 EARLY_STOP_PATIENCE: 3
 
 improvements:
-  - commit: bdae3d0
-    bpb_delta: -0.072
-    description: "Sliding window eval (stride 512)"
-    hardware_validated: "RTX 3070 (300s): standard 1.5568 → sliding 1.4850"
-    needs_h100_validation: true
-  - commit: pending
-    bpb_delta: TBD
-    description: "Consensus stack: int6+zstd+MLP3x+fp16embed+train@2048+tuned hparams"
-  - commit: bb2c4f8
-    bpb_delta: -0.002
-    description: "TTT eval-time adaptation — DROPPED (organizers flagged as against rules)"
-    status: dropped
+  - commit: "sota_rebase"
+    bpb: 1.1248
+    description: "SOTA rebase from PR #315 — 11L, XSA4, Partial RoPE, LN Scale, EMA, int6+zstd22"
+    status: in_progress

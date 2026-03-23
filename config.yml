@@ -82,6 +82,11 @@ SWA_EVERY: 200
 MTP_NUM_HEADS: 0
 MTP_LOSS_WEIGHT: 0.2
 
+# --- MoE (Mixture of Experts) ---
+MOE_ENABLED: 0
+MOE_NUM_EXPERTS: 2
+MOE_AUX_LOSS_WEIGHT: 0.01
+
 # --- Data ---
 DATA_PATH: ./data/datasets/fineweb10B_sp1024
 TOKENIZER_PATH: ./data/tokenizers/fineweb_1024_bpe.model
@@ -105,3 +110,7 @@ improvements:
     bpb: 1.1248
     description: "SOTA rebase from PR #315 — 11L, XSA4, Partial RoPE, LN Scale, EMA, int6+zstd22"
     status: in_progress
+  - commit: "d2e4089"
+    bpb: null
+    description: "Int5 QAT validated — late QAT_BITS=5 matches baseline BPB, 40% smaller artifact. Enables ~45M params in 16MB. Pending H100 validation."
+    status: validated_3070

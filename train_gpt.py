@@ -151,6 +151,11 @@ class Hyperparameters:
     profile_kernels = bool(int(os.environ.get("PROFILE_KERNELS", "0")))
     skip_roundtrip = bool(int(os.environ.get("SKIP_ROUNDTRIP", "0")))
 
+    # --- MoE (Mixture of Experts) ---
+    moe_enabled = bool(int(os.environ.get("MOE_ENABLED", "0")))
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "2"))
+    moe_aux_loss_weight = float(os.environ.get("MOE_AUX_LOSS_WEIGHT", "0.01"))
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -759,6 +764,44 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class MoEMLP(nn.Module):
+    """Soft Mixture-of-Experts MLP: runs all experts and blends by router weights.
+    Fully differentiable, no dynamic control flow — compile-friendly with fullgraph=True.
+    """
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([MLP(dim, mlp_mult) for _ in range(num_experts)])
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        # Zero-init router so training starts near-uniform routing
+        nn.init.zeros_(self.router.weight)
+        # Cached router probs from last forward pass for auxiliary loss
+        self._cached_router_probs: Tensor | None = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        router_logits = self.router(x)  # (B, T, num_experts)
+        router_weights = F.softmax(router_logits, dim=-1)  # (B, T, num_experts)
+        # Cache for auxiliary loss computation (no extra memory — same graph)
+        self._cached_router_probs = router_weights
+
+        output = torch.zeros_like(x)
+        for i, expert in enumerate(self.experts):
+            expert_out = expert(x)
+            output = output + router_weights[..., i:i+1] * expert_out
+
+        return output
+
+    def auxiliary_loss(self) -> Tensor:
+        """Load-balancing loss using cached router probs from last forward pass."""
+        router_probs = self._cached_router_probs  # (B, T, E)
+        assert router_probs is not None, "Must call forward() before auxiliary_loss()"
+        # Fraction of tokens routed to each expert
+        tokens_per_expert = router_probs.mean(dim=(0, 1))  # (E,)
+        # Minimize squared deviation from uniform 1/num_experts
+        target = 1.0 / self.num_experts
+        return ((tokens_per_expert - target) ** 2).sum()
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -771,12 +814,17 @@ class Block(nn.Module):
         rope_dims: int = 0,
         layer_idx: int = 0,
         ln_scale: bool = False,
+        moe_enabled: bool = False,
+        moe_num_experts: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
-        self.mlp = MLP(dim, mlp_mult)
+        if moe_enabled:
+            self.mlp = MoEMLP(dim, mlp_mult, moe_num_experts)
+        else:
+            self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -813,6 +861,9 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
+        moe_enabled: bool = False,
+        moe_num_experts: int = 2,
+        moe_aux_loss_weight: float = 0.01,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -822,6 +873,8 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
+        self.moe_enabled = moe_enabled
+        self.moe_aux_loss_weight = moe_aux_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -841,6 +894,8 @@ class GPT(nn.Module):
                     rope_dims=rope_dims,
                     layer_idx=i,
                     ln_scale=ln_scale,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
                 )
                 for i in range(num_layers)
             ]
@@ -918,6 +973,17 @@ class GPT(nn.Module):
                 mtp_loss_count += 1
             if mtp_loss_count > 0:
                 main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+
+        # MoE auxiliary load-balancing loss
+        if self.training and self.moe_enabled and self.moe_aux_loss_weight > 0.0:
+            aux_loss = x.new_zeros(())
+            aux_count = 0
+            for block in self.blocks:
+                if isinstance(block.mlp, MoEMLP):
+                    aux_loss = aux_loss + block.mlp.auxiliary_loss()
+                    aux_count += 1
+            if aux_count > 0:
+                main_loss = main_loss + self.moe_aux_loss_weight * (aux_loss / aux_count)
 
         return main_loss
 
@@ -1250,6 +1316,9 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
+        moe_enabled=args.moe_enabled,
+        moe_num_experts=args.moe_num_experts,
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1639,6 +1708,9 @@ def main() -> None:
             xsa_last_n=args.xsa_last_n,
             rope_dims=args.rope_dims,
             ln_scale=args.ln_scale,
+            moe_enabled=args.moe_enabled,
+            moe_num_experts=args.moe_num_experts,
+            moe_aux_loss_weight=0.0,
         ).to(device).bfloat16()
         for m in eval_model.modules():
             if isinstance(m, CastedLinear):

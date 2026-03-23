@@ -137,6 +137,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
+    qat_bits = int(os.environ.get("QAT_BITS", "6"))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
@@ -573,15 +574,19 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
+    _qat_qmax: int = 31   # 2^(bits-1) - 1;  default int6: qmax=31, range [-32, 31]
+    _qat_qmin: int = -32
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            qmax = CastedLinear._qat_qmax
+            qmin = CastedLinear._qat_qmin
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                scale = (row_max / float(qmax)).clamp_min(1.0 / float(qmax))
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), qmin, qmax) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -1041,25 +1046,28 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
-def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_intN_per_row(t: Tensor, bits: int = 6) -> tuple[Tensor, Tensor]:
+    qmax = (1 << (bits - 1)) - 1   # int6: 31, int5: 15
+    qmin = -(1 << (bits - 1))      # int6: -32, int5: -16
     t32 = t.float()
     if t32.ndim == 2:
         row_max = t32.abs().amax(dim=1)
-        scale = (row_max / 31.0).clamp_min(1.0 / 31.0).to(torch.float16)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -32, 31).to(torch.int8)
+        scale = (row_max / float(qmax)).clamp_min(1.0 / float(qmax)).to(torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), qmin, qmax).to(torch.int8)
         return q, scale
     amax = t32.abs().max().item()
-    scale = torch.tensor(amax / 31.0 if amax > 0 else 1.0, dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -32, 31).to(torch.int8)
+    scale = torch.tensor(amax / float(qmax) if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), qmin, qmax).to(torch.int8)
     return q, scale
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+def mixed_quantize_intN(state_dict: dict[str, Tensor], intN_cats: set[str], bits: int = 6):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
     late_k_layers = set(range(num_layers_total - 2, num_layers_total))
 
+    quant_label = f"int{bits}"
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1074,11 +1082,11 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_ctrl"
             continue
         # tok_emb.weight falls through to int8 via "embed" category
-        if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
+        if cat in intN_cats and t.ndim >= 1:
+            q, s = quantize_intN_per_row(t, bits=bits)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+            meta[name] = {"type": quant_label}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1086,7 +1094,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = {"type": "int8"}
     return result, meta
 
-def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
+def dequantize_mixed_intN(result: dict[str, Tensor], meta: dict[str, object],
                           template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     for name, orig in template_sd.items():
@@ -1220,6 +1228,8 @@ def main() -> None:
     # -----------------------------
 
     CastedLinear._qat_enabled = args.qat_enabled
+    CastedLinear._qat_qmax = (1 << (args.qat_bits - 1)) - 1
+    CastedLinear._qat_qmin = -(1 << (args.qat_bits - 1))
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1586,18 +1596,20 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
 
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    qbits = args.qat_bits
+    quant_result, quant_meta = mixed_quantize_intN(sd_cpu, {"mlp", "attn"}, bits=qbits)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
+    quant_filename = f"final_model.int{qbits}.ptz"
     if master_process:
-        with open("final_model.int6.ptz", "wb") as f:
+        with open(quant_filename, "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int{qbits}+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Total submission size int{qbits}+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
 
     # Roundtrip: decompress + dequantize into fresh model + eval
     q_val_loss, q_val_bpb = float("nan"), float("nan")
@@ -1609,13 +1621,13 @@ def main() -> None:
     if args.skip_roundtrip:
         log0("SKIP_ROUNDTRIP=1 — skipping post-quant roundtrip eval")
     else:
-        with open("final_model.int6.ptz", "rb") as f:
+        with open(quant_filename, "rb") as f:
             quant_blob_disk = f.read()
         quant_state = torch.load(
             io.BytesIO(zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _COMPRESSOR == "zstd" else zlib.decompress(quant_blob_disk)),
             map_location="cpu",
         )
-        deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+        deq_state = dequantize_mixed_intN(quant_state["w"], quant_state["m"], sd_cpu)
 
         eval_model = GPT(
             vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -1645,10 +1657,10 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"final_int{qbits}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
         )
-        log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(f"final_int{qbits}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
         # Sliding window eval (submission score)
         sw_seq_len = effective_eval_seq_len
@@ -1663,10 +1675,10 @@ def main() -> None:
             )
             torch.cuda.synchronize()
             log0(
-                f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+                f"final_int{qbits}_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
                 f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
             )
-            log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+            log0(f"final_int{qbits}_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if monitor:
         monitor.emit_final(
